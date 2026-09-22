@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自由连接链（FJC）计算器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="viz-root">
+
+  <!-- App Bar：粘在视口顶端，下面是常驻的分区标签（scrollspy）。
+       负外边距把栏撑满 .viz-root 的左右内边距，所以滚动时正文不会从栏底下漏出来。
+       z-index 低于 AI 抽屉（40），抽屉开着时它排在抽屉后面 —— 抽屉是固定定位的浮层。 -->
+  <header class="app-bar" id="app-bar">
+    <div class="bar-row">
+      <div class="head-text">
+        <h1>自由连接链计算器</h1>
+      </div>
+      <div class="head-actions">
+        <button id="ai-toggle" class="tonal-btn" type="button"
+                aria-controls="ai-drawer" aria-expanded="false">AI 助手</button>
+        <button id="theme-toggle" class="tonal-btn" type="button" aria-label="切换深浅色">深色</button>
+      </div>
+    </div>
+
+    <nav class="section-tabs" id="section-tabs" aria-label="页面分区">
+      <a class="section-tab on" href="#sec-params" data-target="sec-params" aria-current="true">参数与结果</a>
+      <a class="section-tab" href="#sec-viz" data-target="sec-viz">可视化</a>
+      <a class="section-tab" href="#sec-scale" data-target="sec-scale">标度验证</a>
+      <a class="section-tab" href="#sec-table" data-target="sec-table">数值表</a>
+    </nav>
+  </header>
+
+  <!-- ============ 分区一：参数与结果 ============ -->
+  <section class="page-section" id="sec-params" aria-labelledby="sec-params-t">
+    <div class="section-head">
+      <h2 id="sec-params-t">参数与结果</h2>
+      <p class="section-lede">
+        链由 <span class="m">n</span> 个长度为 <span class="m">l</span> 的链段自由连接，无键角限制、无位阻。
+        均方末端距 <span class="m">⟨h²⟩ = n·l²</span>，即 <span class="m">h = l√n</span>。
+        结果的长度单位就是 <span class="m">l</span> 的单位 —— <span class="m">l</span> 填 1 nm，答案就是 nm。
+      </p>
+    </div>
+
+    <!-- 一行筛选器，作用于下方全部内容 -->
+    <section class="controls" aria-label="参数">
+      <div class="field field-n">
+        <label class="field-label" for="in-n">链段数 <span class="m">n</span></label>
+        <input id="in-n" type="text" inputmode="numeric" value="100" autocomplete="off"
+               aria-describedby="n-hint">
+        <!-- 快捷值由 app.js 按 N_PRESETS 生成 -->
+        <div class="chips" id="n-chips" role="group" aria-label="n 的预设值"></div>
+      </div>
+      <label class="field">
+        <span class="field-label">链段长度 <span class="m">l</span></span>
+        <input id="in-l" type="text" inputmode="decimal" value="1" autocomplete="off">
+      </label>
+      <label class="check">
+        <input id="in-normalize" type="checkbox">
+        <span>归一化显示</span>
+      </label>
+      <span id="n-hint" class="hint">
+        对比多个 n：点下面的预设值加入/移出，或直接逗号分隔（最多 5 个）
+      </span>
+      <!-- 参数的恢复默认。和「AI 助手 / 深色」分开放：那两个是显示偏好，这一个是会改数的。 -->
+      <div class="btn-row">
+        <button id="reset-btn" class="outlined-btn" type="button">恢复默认</button>
+      </div>
+    </section>
+
+    <div id="alerts" class="alerts" role="status" aria-live="polite"></div>
+
+    <!-- Kuhn 长度预置：把 l 填到正确量级的一条捷径。
+         表本身**只有** fjc_core.KUHN_PRESETS 一份，这里由 app.js 从 /api/kuhn 拉，
+         JS 里不再抄第二份 —— 抄了就会改一处忘一处，两个表各说各话。 -->
+    <section class="card" id="kuhn-card" aria-labelledby="kuhn-title">
+      <div class="card-head">
+        <h2 id="kuhn-title">Kuhn 长度预置（真实高分子）</h2>
+        <button id="kuhn-clear" class="outlined-btn" type="button">回到 l = 1</button>
+      </div>
+      <div class="chips kuhn-chips" id="kuhn-chips" role="group"
+           aria-labelledby="kuhn-title" hidden></div>
+      <div class="readout" id="kuhn-readout" hidden></div>
+      <p class="chart-note" id="kuhn-note">
+        点一个就把顶部的 <span class="m">l</span> 填成它的 Kuhn 长度 <span class="m">b</span>，
+        于是结果的单位跟着变成 nm。
+      </p>
+    </section>
+
+    <!-- h → n 反解：正向是「给 n 求 h」，这里是反过来。必须说清是哪一种 h ——
+         h_rms 和 nl 在同一个 n 下差一到两个数量级，只说「要 100」没有意义。 -->
+    <section class="card" id="solve-card" aria-labelledby="solve-title">
+      <div class="card-head">
+        <h2 id="solve-title">由末端距反解链段数 <span class="m">h → n</span></h2>
+      </div>
+      <div class="chain-controls solve-controls">
+        <div class="field field-sm">
+          <label class="field-label" for="sol-h">目标末端距 <span class="m">h</span></label>
+          <input id="sol-h" type="text" inputmode="decimal" placeholder="37" autocomplete="off"
+                 aria-describedby="solve-note">
+        </div>
+        <div class="field">
+          <label class="field-label" for="sol-kind">这个 <span class="m">h</span> 指的是</label>
+          <select id="sol-kind">
+            <option value="h_rms" selected>根均方末端距 h_rms（= l√n，精确）</option>
+            <option value="h_mean">平均末端距 ⟨h⟩</option>
+            <option value="h_mp">最可几末端距 h*</option>
+            <option value="h_max">全伸展长度 n·l</option>
+          </select>
+        </div>
+        <div class="btn-row">
+          <button id="sol-run" class="btn-primary" type="button">反解</button>
+          <button id="sol-use" class="tonal-btn" type="button" disabled>用 ⌈n⌉ 作为 n</button>
+        </div>
+      </div>
+      <div id="solve-alerts" class="alerts" role="status" aria-live="polite"></div>
+      <div class="readout" id="solve-readout" hidden></div>
+      <p class="chart-note" id="solve-note">
+        <span class="m">l</span> 取顶部参数行的值。注意方向和统计量那边相反：
+        这里 <span class="m">n ∝ (h/l)²</span>，<span class="m">l</span> 翻倍，同一个 <span class="m">h</span>
+        只需要 <span class="m">1/4</span> 的链段数。
+      </p>
+    </section>
+
+    <section class="hero" id="hero" aria-label="主结果">
+      <div class="hero-label" id="hero-label">根均方末端距</div>
+      <div class="hero-value" id="hero-value">–</div>
+      <div class="hero-formula" id="hero-formula"></div>
+    </section>
+
+    <section class="tiles" id="tiles" aria-label="统计量"></section>
+  </section>
+
+  <!-- ============ 分区二：可视化 ============ -->
+  <section class="page-section" id="sec-viz" aria-labelledby="sec-viz-t">
+    <div class="section-head">
+      <h2 id="sec-viz-t">可视化</h2>
+      <p class="section-lede">
+        左边是<strong>系综分布</strong> P(h)，右边是<strong>一次随机实现</strong>的构象 ——
+        两者说的不是同一件事，所以宽屏下特意让它们同屏。
+      </p>
+    </div>
+
+    <div class="layout">
+
+    <section class="card">
+      <div class="card-head">
+        <h2 id="chart-title">末端距分布 P(h)</h2>
+        <div class="card-tools">
+          <div class="legend" id="legend" hidden></div>
+          <button id="chart-png" class="outlined-btn" type="button" disabled>PNG</button>
+        </div>
+      </div>
+      <div class="chart-body" id="chart-body">
+        <svg id="chart" viewBox="0 0 860 440" role="img" tabindex="0"
+             aria-labelledby="chart-title" aria-describedby="chart-desc"></svg>
+        <div class="tooltip" id="tooltip" hidden></div>
+      </div>
+      <p class="chart-note" id="chart-desc">
+        P(h) 是末端距的径向分布（三维），曲线下面积为 1。纵向虚线标出最可几末端距 h*、
+        平均末端距 ⟨h⟩ 与根均方末端距 h_rms。鼠标悬停或聚焦图表后按 ←/→ 可读数。
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 id="chain-title">单链构象（一次实现）</h2>
+        <div class="legend" id="chain-legend" hidden></div>
+      </div>
+
+      <div class="chain-controls">
+        <label class="field">
+          <span class="field-label">链段数 <span class="m">n</span></span>
+          <input id="c-n" type="text" inputmode="numeric" value="1000" autocomplete="off">
+        </label>
+        <label class="field field-sm">
+          <span class="field-label">链数</span>
+          <input id="c-chains" type="text" inputmode="numeric" value="1" autocomplete="off">
+        </label>
+        <label class="field field-sm">
+          <span class="field-label">随机种子</span>
+          <input id="c-seed" type="text" inputmode="numeric" value="12345" autocomplete="off">
+        </label>
+        <label class="check">
+          <input id="c-grid" type="checkbox" checked>
+          <span>网格</span>
+        </label>
+        <div class="btn-row">
+          <button id="c-new" class="tonal-btn" type="button">换一条</button>
+          <button id="c-replay" class="tonal-btn" type="button">播放生长</button>
+          <button id="c-png" class="outlined-btn" type="button">PNG</button>
+          <button id="c-csv" class="outlined-btn" type="button">CSV</button>
+        </div>
+      </div>
+
+      <div id="chain-alerts" class="alerts" role="status" aria-live="polite"></div>
+
+      <div class="chain-body" id="chain-body">
+        <canvas id="chain-canvas" tabindex="0" role="img"
+                aria-labelledby="chain-title"
+                aria-describedby="chain-compare">
+          你的浏览器不支持 canvas，无法显示 3D 构象。各链的顶点坐标可用 CSV 导出。
+        </canvas>
+      </div>
+
+      <div class="compare" id="chain-compare"></div>
+
+      <p class="chart-note">
+        链段长度 <span class="m">l</span> 与上方分布图共用（当前值见顶部参数行）。
+        拖动旋转 · 滚轮缩放 · 双击或按 <kbd>0</kbd> 复位 · 聚焦后方向键旋转、<kbd>+</kbd>/<kbd>-</kbd> 缩放。
+        这张图是<strong>一次随机实现</strong>；左边的 P(h) 是<strong>系综分布</strong>，两者说的不是同一件事。
+      </p>
+    </section>
+
+    </div>
+  </section>
+
+  <!-- ============ 分区三：标度验证 ============ -->
+  <section class="page-section" id="sec-scale" aria-labelledby="sec-scale-t">
+    <div class="section-head">
+      <h2 id="sec-scale-t">标度验证</h2>
+      <p class="section-lede">
+        两件互不相干的验证：<span class="m">⟨R²⟩</span> 是不是真按 <span class="m">n</span> 线性长（下面那张扫描），
+        以及高斯链的熵弹性在多大范围内够用（上面这张力–伸长）。
+      </p>
+    </div>
+
+    <!-- 力–伸长：λ = L(x)，Langevin 反函数。
+         **曲线本身与 n、l 都无关**（L 里根本没有它们），这是它值得单画一张图的理由；
+         n、l 只影响「绝对伸长」那一列和 pN 换算。所有数值都从 /api/force 返回的
+         采样数组里读，前端一个公式都不写。 -->
+    <section class="card" id="force-card" aria-labelledby="force-title">
+      <div class="card-head">
+        <h2 id="force-title">力–伸长曲线（Langevin）</h2>
+        <div class="card-tools">
+          <!-- 两条线（一条数据、一条参考）→ 图例常驻，不随曲线数隐藏 -->
+          <div class="legend" id="force-legend">
+            <span class="legend-item">
+              <span class="legend-key" style="background: var(--series-1)"></span>
+              <span>λ = L(x)　Langevin（精确）</span>
+            </span>
+            <span class="legend-item">
+              <span class="legend-key dash"></span>
+              <span>λ = x/3　高斯链（只到 x = 3）</span>
+            </span>
+          </div>
+          <button id="force-png" class="outlined-btn" type="button" disabled>PNG</button>
+        </div>
+      </div>
+
+      <div class="chain-controls force-controls">
+        <div class="field field-sm">
+          <label class="field-label" for="f-lam">拉伸比例 <span class="m">λ</span> = ⟨x⟩/(n·l)</label>
+          <input id="f-lam" type="text" inputmode="decimal" value="0.5" autocomplete="off"
+                 aria-describedby="force-desc">
+        </div>
+        <div class="readout" id="force-readout" hidden></div>
+      </div>
+
+      <div id="force-alerts" class="alerts" role="status" aria-live="polite"></div>
+
+      <div class="chart-body" id="force-body">
+        <svg id="force-chart" viewBox="0 0 860 420" role="img" tabindex="0"
+             aria-labelledby="force-title" aria-describedby="force-desc"></svg>
+        <div class="tooltip" id="force-tooltip" hidden></div>
+      </div>
+
+      <p class="chart-note" id="force-desc">
+        横轴是无量纲力 <span class="m">x = f·l/(k_BT)</span>，纵轴是归一化伸长
+        <span class="m">λ = ⟨x⟩/(n·l)</span>。<strong>这条曲线与 <span class="m">n</span>、
+        <span class="m">l</span> 都无关</strong> —— Langevin 函数里没有它们；
+        <span class="m">n</span>、<span class="m">l</span> 只在换算成绝对伸长和 pN 时才进来。
+        小力下两条线重合（<span class="m">λ ≈ x/3</span>，正是高斯链的熵弹性），
+        分开了就说明高斯近似开始失效。鼠标悬停可读 x、λ、力（pN）与绝对伸长。
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 id="sweep-title">链长扫描：⟨R²⟩ 随 n 怎么长</h2>
+        <div class="card-tools">
+          <div class="legend" id="sweep-legend" hidden></div>
+          <button id="s-png" class="outlined-btn" type="button" disabled>PNG</button>
+        </div>
+      </div>
+
+      <div class="chain-controls">
+        <div class="field field-lg">
+          <label class="field-label" for="s-n">链段数 <span class="m">n</span>（可多个）</label>
+          <input id="s-n" type="text" value="10, 30, 100, 300, 1000, 3000" autocomplete="off">
+        </div>
+        <div class="field field-sm">
+          <label class="field-label" for="s-chains">每个 n 的链数 <span class="m">M</span></label>
+          <input id="s-chains" type="text" inputmode="numeric" value="10000" autocomplete="off">
+        </div>
+        <div class="field field-sm">
+          <label class="field-label" for="s-seed">随机种子</label>
+          <input id="s-seed" type="text" inputmode="numeric" value="2026" autocomplete="off">
+        </div>
+        <div class="btn-row">
+          <button id="s-geo" class="tonal-btn" type="button">等比序列 10…1000</button>
+          <button id="s-run" class="btn-primary" type="button">运行模拟</button>
+          <button id="s-csv" class="outlined-btn" type="button" disabled>汇总 CSV</button>
+          <button id="s-json" class="outlined-btn" type="button" disabled>完整 JSON</button>
+        </div>
+      </div>
+
+      <div id="sweep-alerts" class="alerts" role="status" aria-live="polite"></div>
+
+      <div class="chart-body" id="sweep-body">
+        <svg id="sweep-chart" viewBox="0 0 1240 500" role="img" tabindex="0"
+             aria-labelledby="sweep-title" aria-describedby="sweep-desc"></svg>
+        <div class="tooltip" id="sweep-tooltip" hidden></div>
+      </div>
+
+      <div class="compare" id="sweep-summary"></div>
+
+      <p class="chart-note" id="sweep-desc">
+        双对数坐标下 <span class="m">⟨R²⟩ = n·l²</span> 是一条斜率恰为 1 的直线：这条线直不直、
+        斜率是不是 1，就是该公式的数值证据。每个 n 采 M 条<strong>独立</strong>链，M 越大点越贴近理论线。
+        这是一次统计测量，不点「运行模拟」就不会算。鼠标悬停圆点可读数，聚焦后按 ←/→ 逐个看。
+      </p>
+    </section>
+  </section>
+
+  <!-- ============ 分区四：数值表 ============ -->
+  <section class="page-section" id="sec-table" aria-labelledby="sec-table-t">
+    <div class="section-head">
+      <h2 id="sec-table-t">数值表</h2>
+      <p class="section-lede">当前各个 <span class="m">n</span> 的全部统计量，制表符分隔，可直接粘进 Excel。</p>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h3 class="card-subtitle">统计量一览</h3>
+        <button id="copy-table" class="outlined-btn" type="button">复制</button>
+      </div>
+      <div class="table-scroll">
+        <table id="table">
+          <caption class="sr-only">自由连接链各统计量数值</caption>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <footer class="foot">
+    自由连接链模型（Freely Jointed Chain）。⟨h²⟩ = n·l² 对 FJC 是精确解；
+    分布 P(h) 用 n 较大时的高斯近似。长度单位随 <span class="m">l</span>，默认 l = 1 时结果以链段长度为单位。
+    改动记录见仓库根目录的 <code>CHANGELOG.md</code>。
+  </footer>
+
+  <!-- AI 助手：右侧固定抽屉。
+       position: fixed 且不占文档流，所以上面 .layout 的 1280px 两栏 / 640px 单列
+       两个断点完全不受它影响 —— 这正是选抽屉而不是第三栏的理由。
+       它必须在 .viz-root 内部：色板 token 定义在 .viz-root 上，不在 :root 上。
+       内容由 ai.js 填充（消息一律用 textContent 渲染，不解析 HTML）。
+       没有配模型网关时抽屉照样能用：助手退到本地模式，按关键词调同一批工具。 -->
+  <aside id="ai-drawer" class="ai-drawer" hidden aria-label="AI 助手">
+    <div class="ai-head">
+      <span class="ai-title">AI 助手</span>
+      <span id="ai-mode" class="ai-mode">读取配置…</span>
+      <button id="ai-setup-btn" class="ai-x" type="button"
+              aria-controls="ai-setup" aria-expanded="false"
+              aria-label="接入设置" title="接入设置">⚙</button>
+      <button id="ai-close" class="ai-x" type="button" aria-label="关闭助手">×</button>
+    </div>
+
+    <!-- 接入设置：填 OpenAI 兼容网关的 endpoint / model / key。
+         **只有用户点按钮会走到这里** —— 不是助手的工具，模型改不了它：
+         能改 endpoint 就等于能把下一问连同密钥发到它挑的地方。
+         保存走 POST /api/ai/config，写回同目录的 ai_config.json（下次调用即生效，不用重启）。
+         密钥那栏是 type="password" 且**从不回填**：页面上只有掩码，把掩码当值填进去的话，
+         用户一进表单点保存就会把真 key 覆盖成 ••••3333 —— 所以留空的语义是「不改」。 -->
+    <div id="ai-setup" class="ai-setup" hidden>
+      <p class="ai-setup-lede">
+        填一个 <strong>OpenAI 兼容</strong>网关的接入信息，保存到本机的
+        <code>ai_config.json</code>。密钥只发给这里填的地址，不进对话、保存后不回显。
+      </p>
+
+      <div class="ai-setup-field">
+        <label for="ai-f-preset">选择服务商</label>
+        <select id="ai-f-preset" autocomplete="off">
+          <option value="">自定义 / 不改</option>
+          <!-- 其余选项由 ai.js 按 /api/ai/status 的 providers 生成 -->
+        </select>
+      </div>
+
+      <div class="ai-setup-field">
+        <label for="ai-f-endpoint">接口地址 endpoint</label>
+        <input id="ai-f-endpoint" type="url" spellcheck="false" autocomplete="off"
+               placeholder="https://api.deepseek.com/v1"
+               aria-describedby="ai-f-note">
+      </div>
+
+      <div class="ai-setup-field">
+        <label for="ai-f-model">模型 model</label>
+        <input id="ai-f-model" type="text" spellcheck="false" autocomplete="off"
+               placeholder="deepseek-chat">
+      </div>
+
+      <div class="ai-setup-field">
+        <label for="ai-f-key">密钥 key</label>
+        <input id="ai-f-key" type="password" spellcheck="false"
+               autocomplete="new-password">
+      </div>
+
+      <div class="ai-setup-btns">
+        <button id="ai-f-save" class="btn-primary" type="button">保存</button>
+        <button id="ai-f-test" class="tonal-btn" type="button">测试连接</button>
+        <button id="ai-f-clear" class="outlined-btn" type="button">清除密钥</button>
+      </div>
+
+      <div id="ai-f-msg" class="ai-setup-msg" role="status" aria-live="polite"></div>
+
+      <p id="ai-f-note" class="ai-setup-note">
+        密钥留空＝不改（页面只存掩码，没法回填原文）。endpoint 只往后接
+        <code>/chat/completions</code>，不替你猜 <code>/v1</code>。保存后下一句提问即生效，
+        不用重启；要是设了 <code>FJC_LLM_*</code> 环境变量，它们会压过这里填的值。
+      </p>
+    </div>
+
+    <div id="ai-msgs" class="ai-msgs" role="log" aria-live="polite"
+         aria-label="对话记录"></div>
+
+    <div class="ai-foot">
+      <div id="ai-phase" class="ai-phase" hidden></div>
+      <textarea id="ai-input" class="ai-input" rows="2" autocomplete="off"
+                placeholder="问点什么… Enter 发送，Shift+Enter 换行"
+                aria-label="向助手提问"></textarea>
+      <div class="ai-btns">
+        <button id="ai-setup-open" class="tonal-btn" type="button"
+                aria-controls="ai-setup" aria-expanded="false">接入设置</button>
+        <button id="ai-send" class="btn-primary" type="button">发送</button>
+        <button id="ai-stop" class="tonal-btn" type="button" disabled>停止</button>
+        <span id="ai-cfg" class="ai-cfg"></span>
+      </div>
+    </div>
+  </aside>
+
+</div>
+<script src="app.js"></script>
+<script src="chain3d.js"></script>
+<script src="sweep.js"></script>
+<script src="ai.js"></script>
+</body>
+</html>

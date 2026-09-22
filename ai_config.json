@@ -1,0 +1,5 @@
+{
+  "model": "deepseek-chat",
+  "endpoint": "https://api.deepseek.com/",
+  "key": "sk-b8cbacddd53d41bc8bfc168f5563b1e5"
+}
