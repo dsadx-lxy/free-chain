@@ -13,9 +13,10 @@ ai_config.json**，也就是把使用者的 DeepSeek 密钥连同软件一起发
 
   1. 一份**写在明处的排除清单**（密钥 / 字节码 / 锁文件 / dist 自己）；
   2. 打完**把 zip 重新打开逐条查一遍** —— 不只是「按清单排除了」，
-     而是真的回去看产物里有什么；还会用本机 ai_config.json 的 key 原文
-     去扫包里每一个文本文件，确认它没被抄进 README、测试或别处。
-     查出问题就**删掉 zip 并以非零码退出**，不给「先发了再说」留缝；
+     而是真的回去看产物里有什么；还会用本机凭据（ai_config.json 的 key、
+     token.txt 的 token）的原文去扫包里每一个文本文件，确认它没被抄进
+     README、测试或别处。查出问题就**删掉 zip 并以非零码退出**，
+     不给「先发了再说」留缝；
   3. 打印最终清单与体积，发出去之前一眼能看完。
 
 用法
@@ -42,7 +43,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # 排除清单分三类写，改的时候知道自己动的是哪一类。
-SECRET_FILES = {"ai_config.json"}                      # 1) 密钥：这个脚本存在的理由
+SECRET_FILES = {"ai_config.json", "token.txt", ".gh_token"}   # 1) 凭据：这个脚本存在的理由
 JUNK_DIRS = {"__pycache__", "dist", ".git", ".claude", ".idea", ".vscode"}
 JUNK_SUFFIXES = (".pyc", ".pyo")                       # 2) 生成物 / 版本控制 / 编辑器残留
 JUNK_PREFIXES = ("~$",)                                #    Office 锁文件
@@ -79,17 +80,32 @@ def collect(with_slides: bool) -> list[str]:
     return sorted(out)
 
 
-def local_key() -> str | None:
-    """本机 ai_config.json 里的 key 原文；没有 / 读不出来就返回 None。"""
+def local_secrets() -> list[str]:
+    """本机凭据的原文：ai_config.json 里的 key + token.txt 里的 token。
+
+    读不出来就跳过 —— 少扫一条不代表放行，只是那一项没得比。
+    两份都要扫，因为泄漏从来不看文件叫什么名字：真出事的是「那段文本
+    出现在了包里」，而不是「那个文件在包里」。
+    """
+    out = []
     try:
         with open(os.path.join(ROOT, "ai_config.json"), encoding="utf-8") as fh:
             v = json.load(fh).get("key")
+        if isinstance(v, str) and len(v) >= 8:
+            out.append(v)
     except Exception:
-        return None
-    return v if isinstance(v, str) and len(v) >= 8 else None
+        pass
+    try:
+        with open(os.path.join(ROOT, "token.txt"), encoding="utf-8") as fh:
+            v = fh.read().strip()
+        if len(v) >= 8:
+            out.append(v)
+    except Exception:
+        pass
+    return out
 
 
-def verify(zip_path: str, key: str | None) -> list[str]:
+def verify(zip_path: str, secrets: list[str]) -> list[str]:
     """把 zip 重新打开逐条查。返回问题列表，空列表 = 干净。"""
     problems = []
     with zipfile.ZipFile(zip_path) as z:
@@ -97,19 +113,20 @@ def verify(zip_path: str, key: str | None) -> list[str]:
             rel = info.filename
             base = rel.rsplit("/", 1)[-1]
             if base in SECRET_FILES:
-                problems.append(f"{rel}：密钥文件不该进包")
+                problems.append(f"{rel}：凭据文件不该进包")
             if "__pycache__" in rel or base.endswith(JUNK_SUFFIXES):
                 problems.append(f"{rel}：字节码缓存")
             if base.startswith(JUNK_PREFIXES):
                 problems.append(f"{rel}：Office 锁文件")
-            # 最后这道是防「key 被抄进别处」：名字查不出来，只有内容扫得出来。
-            if key and info.file_size and not base.lower().endswith(BINARY_SUFFIXES):
+            # 最后这道是防「凭据被抄进别处」：名字查不出来，只有内容扫得出来。
+            if secrets and info.file_size and not base.lower().endswith(BINARY_SUFFIXES):
                 try:
                     text = z.read(rel).decode("utf-8", "ignore")
                 except Exception:
                     continue
-                if key in text:
-                    problems.append(f"{rel}：**里面出现了本机密钥原文**")
+                for s in secrets:
+                    if s in text:
+                        problems.append(f"{rel}：**里面出现了本机凭据原文**")
     return problems
 
 
@@ -157,8 +174,8 @@ def main(argv=None) -> int:
         for rel in files:
             z.write(os.path.join(ROOT, rel), rel)
 
-    key = local_key()
-    problems = verify(zip_path, key)
+    secrets = local_secrets()
+    problems = verify(zip_path, secrets)
     if problems:
         os.remove(zip_path)
         print("\n产物有问题，已删除，没有留下半成品：", file=sys.stderr)
@@ -170,8 +187,8 @@ def main(argv=None) -> int:
     print(f"\n{zip_path}")
     print(f"  {len(files)} 个文件，{size / 1048576:.1f} MB"
           f"（压缩率 {100 * (1 - size / total):.0f}%）")
-    print("  复检通过：无密钥文件、无字节码、无锁文件"
-          + ("；已用本机 key 原文扫过全部文本内容" if key else ""))
+    print("  复检通过：无凭据文件、无字节码、无锁文件"
+          + (f"；已用本机 {len(secrets)} 条凭据原文扫过全部文本内容" if secrets else ""))
     if not args.with_slides:
         print("  注：汇报 pptx 没打进去，要的话加 --with-slides。")
     return 0

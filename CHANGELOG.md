@@ -6,6 +6,36 @@
 
 ---
 
+## [2026-09-22] token.txt 也不再随包发出去
+
+### Security
+
+- `token.txt` 放进项目根目录准备上传用，而它**不在任何排除清单里**：
+  `.gitignore` 只挡 `ai_config.json` / `__pycache__` / `dist/` / `~$*`，
+  `打包.py` 的 `SECRET_FILES` 里也只有 `ai_config.json`。
+  拿 `打包.py --list` 一试就露了 —— **它会照常把 `token.txt` 列进包里**，
+  把上面刚修完的那个错原样再犯一遍。
+- 和 `ai_config.json` 是同一类东西：**能花的凭据**，不是配置文件。
+  GitHub token 能推代码、能改仓库，进了 zip 就等于谁下载谁能用。
+
+### Changed
+
+- `.gitignore` 增第五组：`token.txt` / `.gh_token`。
+- `打包.py` 的 `SECRET_FILES` 补上 `token.txt` 与 `.gh_token`；
+  `local_key()` 扩成 `local_secrets()` —— **同时**读 `ai_config.json` 的 key
+  和 `token.txt` 的 token，两条原文都拿去扫包里每一个文本文件。
+  措辞从「密钥」改成「凭据」：这道检查防的一直是「那段文本出现在了包里」，
+  跟那个文件叫什么名字无关。
+
+### Notes
+
+- `token.txt` 用完就删。放在项目目录里、只靠 `.gitignore` 挡着只有一层纸 ——
+  复制目录、换个打包方式、或者手滑 `git add -f`，任何一样都能穿过去。
+- 实测：修之前 `打包.py --list` 列出 `token.txt`；修之后不再列出，
+  成品 32 个文件，和上一版干净包一致（凭据文件、字节码、锁文件、pptx 都在包外）。
+
+---
+
 ## [2026-09-22] 密钥不再随仓库和 zip 一起发出去
 
 ### Security
