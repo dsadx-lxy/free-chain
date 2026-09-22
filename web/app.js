@@ -665,18 +665,28 @@ function initRipple() {
   }, { passive: true });
 }
 
-/* ---------------- App Bar 高度 + 分区 scrollspy ---------------- */
+/* ---------------- 吸顶高度 + 分区 scrollspy ---------------- */
 
 function initScrollSpy() {
   const bar = $('app-bar');
+  const nav = $('section-tabs');
   const tabs = [...document.querySelectorAll('.section-tab')];
   const secs = tabs.map((t) => $(t.dataset.target)).filter(Boolean);
   if (!bar || !secs.length) return;
 
-  // scroll-margin-top 和点击跳转都要用到栏高，而栏高会随换行变，所以量出来写进
-  // --bar-h（写在 :root 上，CSS 那边直接 calc）。
+  // 分区导航有两种形态（见 style.css 的 .side-nav）：
+  //   宽屏 —— 左侧竖排 rail，不占竖直空间，吸顶的只有 App Bar；
+  //   窄屏 —— 顶部横条，压在 App Bar 上面，两者叠起来才是遮挡高度。
+  // 所以 --nav-h 在宽屏记 0、窄屏记条高；scroll-margin 和点击偏移都用它 + --bar-h。
+  // 用 flexDirection 判形态，比比坐标稳：sticky 状态下 getBoundingClientRect()
+  // 会随滚动变，flex 方向不会。
+  let stickyTop = bar.offsetHeight;
   const measure = () => {
+    const railOnSide = !!nav && getComputedStyle(nav).flexDirection === 'column';
+    const navH = nav && !railOnSide ? nav.offsetHeight : 0;
+    stickyTop = bar.offsetHeight + navH;
     document.documentElement.style.setProperty('--bar-h', `${bar.offsetHeight}px`);
+    document.documentElement.style.setProperty('--nav-h', `${navH}px`);
   };
   measure();
 
@@ -686,7 +696,7 @@ function initScrollSpy() {
     ticking = true;
     requestAnimationFrame(() => {
       ticking = false;
-      const offset = bar.offsetHeight + 24;
+      const offset = stickyTop + 24;
       let cur = secs[0];
       secs.forEach((s) => { if (s.getBoundingClientRect().top <= offset) cur = s; });
       // 滚到底时最后一节可能永远没越过阈值，直接钉到最后一个
@@ -700,19 +710,32 @@ function initScrollSpy() {
         else t.removeAttribute('aria-current');
       });
       bar.classList.toggle('stuck', window.scrollY > 4);
+      if (nav) nav.classList.toggle('stuck', window.scrollY > 4);
     });
   };
 
   window.addEventListener('scroll', sync, { passive: true });
   window.addEventListener('resize', () => { measure(); sync(); });
+  // 只听 window.resize 会漏：抽屉开合、标题换行、以及**面板从隐藏变可见**都会改栏高，
+  // 而这些一个 resize 事件都不发。ResizeObserver 直接盯盒子本身，补上这条。
+  // 往回写 --bar-h / --nav-h 不改变这两个盒子的尺寸（一个只影响 scroll-margin、
+  // 一个只影响 .app-bar 的 top），所以不会形成回调环。
+  if (typeof ResizeObserver === 'function') {
+    const ro = new ResizeObserver(() => { measure(); sync(); });
+    ro.observe(bar);
+    if (nav) ro.observe(nav);
+  }
+  window.addEventListener('load', () => { measure(); sync(); });
   sync();
 
   tabs.forEach((t) => t.addEventListener('click', (ev) => {
     ev.preventDefault();
     const el = $(t.dataset.target);
     if (!el) return;
+    // 抽屉开合会改正文宽度、标题跟着换行，栏高不一定还是上次量的值
+    measure();
     window.scrollTo({
-      top: el.getBoundingClientRect().top + window.scrollY - (bar.offsetHeight + 12),
+      top: el.getBoundingClientRect().top + window.scrollY - (stickyTop + 12),
       behavior: 'smooth',
     });
   }));

@@ -136,12 +136,17 @@ body {
 }
 
 .viz-root {
-  max-width: 1440px;
+  max-width: 1600px;
   margin: 0 auto;
   /* 顶部内边距交给 .app-bar 自己出（它带负外边距把底色铺满整幅宽度） */
   padding: 0 20px 64px;
   background: var(--page);
 }
+
+/* 左侧 rail 分掉 164px + 1px 分界线 + 20px 正文缩进 = 185px 的新「装订边」，
+   原来只有 20px。max-width 从 1440 抬到 1600 正好把这 165px 还回去
+   （1600 − 205 = 1395 ≈ 原来的 1400），两张并排图不会因为加了导航而变窄。
+   rail 只在 ≥900px 出现，窄屏不占宽度，所以这个数只对宽屏有意义。 */
 
 /* 两张图并排：左边是系综分布 P(h)，右边是一次实现的构象。
    这个配对本身就是页面要讲的事，所以宽屏下特意让它们同屏。 */
@@ -165,9 +170,11 @@ body {
 
 .app-bar {
   position: sticky;
-  top: 0;
+  /* 窄屏时分区导航横在它上面，top 被 --nav-h 撑开；宽屏 rail 在左边不占竖直空间，
+     JS 那边就把 --nav-h 记成 0，于是这里算出来还是 0 —— 一条规则两边通用。 */
+  top: var(--nav-h, 0px);
   z-index: 30;
-  /* 负外边距把栏撑到 .viz-root 的左右内边距之外，滚动时正文不会从栏底下漏出来。
+  /* 负外边距把栏撑到 .main-col 的左右内边距之外，滚动时正文不会从栏底下漏出来。
      打开 AI 抽屉时 .viz-root 多了 400px 的右内边距，这里 -20px 恰好让栏的右缘
      贴着抽屉左缘（380px）—— 不会钻到抽屉底下。 */
   margin: 0 -20px;
@@ -177,6 +184,12 @@ body {
 }
 /* 滚起来以后加一层极轻的投影，和正文分开 —— M3 的 elevation 只在需要分层时给 */
 .app-bar.stuck { box-shadow: var(--md-elev-1); }
+/* 投影**只给窄屏那条横吸顶条**。宽屏的侧栏同样会拿到 .stuck，
+   但它左边贴着页缘、右边挨着竖线，再压一层 --md-elev-1（带 1px spread）
+   就会在页角围出一张悬浮卡片 —— 侧栏是页面结构的一部分，不是浮层。 */
+@media (max-width: 899px) {
+  .side-nav.stuck { box-shadow: var(--md-elev-1); }
+}
 
 .bar-row {
   display: flex;
@@ -204,16 +217,26 @@ body {
 
 .head-actions { display: flex; gap: 8px; flex: none; padding-top: 3px; }
 
-/* ---------- 分区标签（scrollspy） ---------- */
+/* ---------- 分区导航（scrollspy） ----------
+   基础样式是**窄屏的横条**；≥900px 在文件后面翻成左侧竖排 rail。
+   两套只差 flex 方向和几个盒模型，标签本身、高亮态、focus 环、水波纹完全共用 ——
+   分两套组件写的话，改一处忘一处是迟早的事。 */
 
-.section-tabs {
+.side-nav {
+  position: sticky;
+  top: 0;
+  /* 比 App Bar（30）高一格：两层都是 sticky，窄屏下万一重叠由导航赢 */
+  z-index: 31;
   display: flex;
   gap: 4px;
-  margin-top: 10px;
+  margin: 0 -20px;          /* 和 App Bar 一样撑满容器内宽，滚动时不留缝 */
+  padding: 8px 20px;
+  background: var(--page);
+  border-bottom: 1px solid var(--md-outline-variant);
   overflow-x: auto;
   scrollbar-width: none;
 }
-.section-tabs::-webkit-scrollbar { display: none; }
+.side-nav::-webkit-scrollbar { display: none; }
 
 .section-tab {
   flex: none;
@@ -238,12 +261,91 @@ body {
 }
 .section-tab:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; }
 
+/* ---------- 宽屏：翻成左侧竖排 rail ----------
+   grid 只开两列，且**只包 .side-nav 和 .main-col** —— AI 抽屉是 position:fixed，
+   不算 grid item，所以它照旧浮在右边，1280px / 640px 两个断点一个都没动。
+   分界竖线画在 .main-col 的 border-left 上：rail 是 sticky、只有内容那么高，
+   用它自己的右边框的话线只画得到上面那一截。 */
+@media (min-width: 900px) {
+  .viz-root {
+    display: grid;
+    grid-template-columns: 164px minmax(0, 1fr);
+    padding-left: 0;          /* 左边缘交给 rail，正文不再另留 20px */
+  }
+
+  .side-nav {
+    grid-column: 1;
+    /* sticky 的活动范围就是它的 grid area。align-self:start 让盒子只有内容那么高，
+       而 area 拉满整行 —— 于是它能一路跟着滚，又不会把第一列撑成全高。
+       top:0 + padding-top:14 让第一条的字心落在 y≈33.5，和右边 28px 标题的字心
+       齐平；scrollY=0 时 sticky 也把这个值当约束，所以上下都不会跳。 */
+    position: sticky;
+    top: 0;
+    align-self: start;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    margin: 0;
+    padding: 14px 10px 28px;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    overflow: visible;
+  }
+
+  /* 侧栏项：当前项 = 浅底 + 左侧 3px 指示条 + 字重 600，三重信号。
+     **不再整块反白** —— 横条上那种小药丸挪到竖排就是一块 140×40 的墨砖，
+     压在页角上又重又空。hover 只给 :not(.on) 的项，免得鼠标移上去
+     和「当前项」分不清。 */
+  .side-nav .section-tab {
+    padding: 10px 12px 10px 16px;
+    border-radius: 8px;      /* 和横条 chip 同为 8px，不另起一套 */
+    font-size: 13.5px;
+    background: transparent;
+    color: var(--md-on-surface-variant);
+  }
+  .side-nav .section-tab:not(.on):hover {
+    background: var(--md-state-hover);
+    color: var(--md-on-surface);
+  }
+  .side-nav .section-tab.on {
+    font-weight: 600;
+    color: var(--md-on-surface);
+    background: var(--md-surface-container-highest);
+  }
+  /* 指示条画在项内部：.section-tab 有 overflow:hidden（水波纹要裁），
+     伸出盒子外会被切掉。项高 ≈39px、圆角 8px，左侧直边只剩 y=8..31，
+     18px 高居中正好落在 10.5..28.5，不会啃到圆角。 */
+  .side-nav .section-tab.on::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3px;
+    height: 18px;
+    border-radius: 0 3px 3px 0;
+    background: var(--md-primary);
+  }
+
+  .main-col {
+    grid-column: 2;
+    min-width: 0;            /* 否则网格项按内容最小宽度算，宽表会把列撑破 */
+    border-left: 1px solid var(--md-outline-variant);
+    padding-left: 20px;
+  }
+}
+
 /* ---------- 分区 ---------- */
 
-.page-section { scroll-margin-top: calc(var(--bar-h, 110px) + 14px); }
-.page-section + .page-section { margin-top: 40px; }
+/* --nav-h 窄屏是横条高度、宽屏是 0（JS 量出来写进 :root），
+   --bar-h 是 App Bar 高度。两者相加才是「被吸顶栏盖住的那一段」。 */
+.page-section { scroll-margin-top: calc(var(--nav-h, 0px) + var(--bar-h, 110px) + 14px); }
+/* 分区间距比卡与卡之间的 20px 大一档 —— 左边那列导航把四个分区当成四个「页面」在列，
+   换页就该比换卡片更有分量。 */
+.page-section + .page-section { margin-top: 48px; }
 
-.section-head { margin-bottom: 14px; }
+.section-head { margin-bottom: 18px; }
 
 .section-head h2 {
   margin: 0 0 4px;
@@ -576,7 +678,7 @@ body {
 
 .hero {
   padding: 22px 24px;
-  margin-bottom: 16px;
+  margin-bottom: 20px;      /* 和上下卡片的 20px 一档，别单独走 16 */
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -602,11 +704,35 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 宽屏下正文列有一千三百多像素，三行小字堆在左边会让这一整条几乎全空。
+   把推导式挪到右下角、贴着大数字的底基线：左边是答案，右边是怎么来的，
+   中间那片空白才算是排版而不是浪费。DOM 顺序一个字没动，只改摆位。
+   max-width 拦一下「对比模式」那句长后缀 —— 不拦它会把大数字挤到换行。 */
+@media (min-width: 900px) {
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 28px;
+  }
+  .hero-label { grid-column: 1; grid-row: 1; }
+  .hero-value { grid-column: 1; grid-row: 2; }
+  .hero-formula {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: end;
+    max-width: 46ch;
+    text-align: right;
+  }
+}
+
 /* ---------- 统计量卡片 ---------- */
 
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(178px, 1fr));
+  /* 178 → 160：正文列 1220px 时 178 只排得下 6 列，7 个统计量变成 6+1，
+     最后一个孤零零占一行；160 正好放 7 个，宽屏下一行排满。
+     统计量就这 7 项（见 app.js 的 TILES），不是会一直涨的列表。 */
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 4px;
 }
@@ -651,20 +777,22 @@ body {
 /* ---------- 图表卡片 ---------- */
 
 .card {
-  padding: 18px 20px 14px;
+  padding: 18px 20px 16px;
   margin-bottom: 20px;
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
-.page-section > .card:last-child { margin-bottom: 0; }
+/* 分区里最后一个元素不再留底距 —— 分区间距（48px）就是它的下边界。
+   原来只对 .card 生效，.tiles 漏在外面，带着 4px 的残余。 */
+.page-section > :last-child { margin-bottom: 0; }
 
 .card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .card-head h2 {
@@ -949,6 +1077,7 @@ tbody tr:hover { background: var(--hover); }
 
 @media (max-width: 640px) {
   .viz-root { padding: 0 14px 48px; }
+  .side-nav { margin: 0 -14px; padding: 7px 14px; }
   .app-bar { margin: 0 -14px; padding: 14px 14px 0; }
   .head-text h1 { font-size: 22px; }
   .section-head h2 { font-size: 20px; }

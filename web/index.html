@@ -9,8 +9,26 @@
 <body>
 <div class="viz-root">
 
-  <!-- App Bar：粘在视口顶端，下面是常驻的分区标签（scrollspy）。
-       负外边距把栏撑满 .viz-root 的左右内边距，所以滚动时正文不会从栏底下漏出来。
+  <!-- 分区导航。同一份标记两种形态（见 style.css 的 .side-nav）：
+       ≥900px 是**左侧竖排 rail**，占 grid 第一列，正文整体右移；
+       <900px 退回**顶部横条**，sticky top:0，App Bar 的 top 由 --nav-h 撑开。
+       放在 .main-col 之前 —— 宽屏靠 grid 自动落进第一列，窄屏自然排在标题上面。
+       scrollspy 和点击跳转的逻辑一个字没改，改的只是标签往哪个方向排。 -->
+  <nav class="side-nav" id="section-tabs" aria-label="页面分区">
+    <a class="section-tab on" href="#sec-params" data-target="sec-params" aria-current="true">参数与结果</a>
+    <a class="section-tab" href="#sec-viz" data-target="sec-viz">可视化</a>
+    <a class="section-tab" href="#sec-scale" data-target="sec-scale">标度验证</a>
+    <a class="section-tab" href="#sec-table" data-target="sec-table">数值表</a>
+  </nav>
+
+  <!-- 正文列：App Bar + 四个分区 + 页脚全在里面。
+       宽屏时它自己带 border-left，那条竖线就是 rail 和正文的分界 ——
+       用 .main-col 的边而不是 .side-nav 的，因为 rail 是 sticky、只有内容那么高，
+       它自己的右边框只画得到那一截；.main-col 拉满整行，线才连得下来。 -->
+  <div class="main-col">
+
+  <!-- App Bar：粘在视口顶端。窄屏时它排在分区导航下面，top 用 --nav-h 撑开；
+       负外边距把栏撑满 .main-col 的左右内边距，滚动时正文不会从栏底下漏出来。
        z-index 低于 AI 抽屉（40），抽屉开着时它排在抽屉后面 —— 抽屉是固定定位的浮层。 -->
   <header class="app-bar" id="app-bar">
     <div class="bar-row">
@@ -23,13 +41,6 @@
         <button id="theme-toggle" class="tonal-btn" type="button" aria-label="切换深浅色">深色</button>
       </div>
     </div>
-
-    <nav class="section-tabs" id="section-tabs" aria-label="页面分区">
-      <a class="section-tab on" href="#sec-params" data-target="sec-params" aria-current="true">参数与结果</a>
-      <a class="section-tab" href="#sec-viz" data-target="sec-viz">可视化</a>
-      <a class="section-tab" href="#sec-scale" data-target="sec-scale">标度验证</a>
-      <a class="section-tab" href="#sec-table" data-target="sec-table">数值表</a>
-    </nav>
   </header>
 
   <!-- ============ 分区一：参数与结果 ============ -->
@@ -349,6 +360,8 @@
     分布 P(h) 用 n 较大时的高斯近似。长度单位随 <span class="m">l</span>，默认 l = 1 时结果以链段长度为单位。
     改动记录见仓库根目录的 <code>CHANGELOG.md</code>。
   </footer>
+
+  </div><!-- /.main-col -->
 
   <!-- AI 助手：右侧固定抽屉。
        position: fixed 且不占文档流，所以上面 .layout 的 1280px 两栏 / 640px 单列

@@ -6,6 +6,86 @@
 
 ---
 
+## [2026-09-22] 分区导航挪到左侧 + 版式重排
+
+### Changed
+
+- **四个分区标签从 App Bar 里挪到左侧，排成一条竖列**（宽屏 `≥900px`）。
+  点击仍然是**平滑滚动跳到那一节** —— 也就是选的那条「仍然滚动跳转」：
+  页面还是一页四个 `<section>`，没有改成真的翻页，也没有上 hash 路由。
+  scrollspy（滚到哪节高亮哪个、滚到底钉住最后一个）的逻辑一个字没改，
+  改的只是标签往哪个方向排、排在哪儿。
+  `index.html` 里**类名从 `section-tabs` 换成 `side-nav`，id 保留 `section-tabs`**
+  —— `app.js` 是按 id 取的，改类名不会碰到 JS。
+- **同一份标记两种形态**，靠 `@media (min-width: 900px)` 翻：
+  - **≥900px**：`.viz-root` 变成 `grid-template-columns: 164px minmax(0,1fr)`，
+    rail 落第一列、正文落第二列；rail 是 `position: sticky; top: 0; align-self: start`，
+    所以它一路跟着滚但不把第一列撑成全高。第一列右边那条贯穿全页的竖线
+    画在 **`.main-col` 的 `border-left`** 上，不是 rail 的边 —— rail 是 sticky、
+    只有内容那么高，它自己的右边框只画得到那一截。
+  - **<900px**：完全退回原来的顶部横条（`sticky top:0`、横向滚动、负外边距撑满）。
+- **`--nav-h` 让一条规则同时服务两种形态**：JS 量出 rail 在不在侧边
+  （`flexDirection === 'column'`，比比坐标稳 —— sticky 下 `getBoundingClientRect()`
+  会随滚动变，flex 方向不会），rail 形态记 `0px`、横条形态记条高；
+  `.app-bar { top: var(--nav-h) + var(--bar-h) }` 和
+  `.page-section { scroll-margin-top: … }` 都由这两个变量拼出来，不用写两套。
+  顺带补了 `ResizeObserver`（盯 bar 和 nav 本身）和 `load` 监听：抽屉开合、
+  标题换行、**面板从隐藏变可见**都会改栏高，而这些一个 `resize` 事件都不发。
+- **`max-width` 1440 → 1600**。rail 吃掉的是一条新「装订边」：
+  164（栏）+ 1（分界线）+ 20（正文缩进）+ 20（viz 右内边距）= 205，
+  原来只有 20。`1600 − 205 = 1395 ≈` 原来的 1400 —— 两张并排的图
+  不会因为加了一条导航而变窄。
+- **版式重排**：
+  - 分区间距 20 → **48px**（左边那列把四个分区当成四个「页面」在列，间距要对得起这个语义）；
+  - `.section-head` 下边距 14 → 18px，`.card-head` 10 → 12px，`.card` 底 14 → 16px；
+  - `.hero` 在 ≥900px 改成两栏 grid：大数字占左列，**推导式挪到右下角、
+    贴着大数字的底基线**（原来三行小字堆在左边，右边一千三百多像素几乎全空）；
+  - `.tiles` 的 `minmax(178px)` → **`minmax(160px)`**；
+  - `:last-child` 的收尾规则从 `.card:last-child` 放宽到 `.page-section > :last-child`
+    （原来 `.tiles` 漏在外面，带着 4px 残余）。
+- **侧栏当前项不再整块反白**。横条上那种小药丸搬到竖排里就是一块 140×40 的墨砖，
+  压在页角上又重又空。改成 M3 导航栏的三重信号：
+  **浅底 `--md-surface-container-highest` + 左侧 3px `--md-primary` 指示条 + 字重 600**，
+  未选中项是 `--md-on-surface-variant` 的 500。hover 只给 `:not(.on)` 的项，
+  免得鼠标移上去和「当前项」分不清。横条形态（<900px）的实心药丸**没动** ——
+  小尺寸上它是对的。
+
+### Fixed
+
+- **侧栏吸顶时被围成一张浮在页角的卡片**。`.side-nav.stuck` 原来在所有宽度
+  都吃 `--md-elev-1`，而它带 1px spread，于是 rail（左边贴页缘、右边挨竖线）
+  被压出一圈完整轮廓。投影关进 `@media (max-width: 899px)`，宽屏 `box-shadow: none` ——
+  侧栏是页面结构的一部分，不是浮层。窄屏那条横吸顶条仍然要投影（它下面没有竖线可分隔）。
+- **rail 引入后 1440px 下统计量卡片掉成 6+1**。正文列从 1400 被挤到 1220，
+  `minmax(178px)` 排不下 7 个。降到 160 后 1220 正好放 7 项一行；
+  1280 视口下（内容 1060）仍是 6+1，和改版前一模一样 —— 没有顺带改动别处的断行。
+
+### Notes
+
+- 侧栏的第一项和右边 28px 标题**字心齐平**（都在 y≈33.5）：
+  `top: 0` + `padding-top: 14px`。`scrollY = 0` 时 sticky 也把这个值当约束，
+  所以上下都不会跳。
+- 指示条画在项**内部**（`left: 0`）：`.section-tab` 带 `overflow: hidden`
+  （水波纹要裁），伸出盒子外会被切掉。项高 ≈39px、圆角 8px，左侧直边只剩 y=8..31，
+  18px 高居中正好落在 10.5..28.5，啃不到圆角。
+- AI 抽屉仍然是 `position: fixed`、**不是 grid item**，所以 1280px 两栏 /
+  640px 单列两个断点一个都没动。
+- **`--series-*` 一个值都没碰**（仍过 `validate_palette.js`）；
+  新样式只用 `--md-*` / `--page` / `--text-*`。
+
+### Tests
+
+- 四个宽度逐项 DOM 度量确认（1440 rail / 1280 rail / 800 横条 / 375 横条）：
+  grid 分列、`--nav-h` 0 与非 0、`scroll-margin-top`、rail 粘顶位置、
+  跳转公式复算（跳到「标度验证」后 `getBoundingClientRect().top === stickyTop + 12` 精确成立）、
+  底部钉住高亮、`scrollWidth == clientWidth` 无横向溢出、7 项统计量仍排一行。
+- 深浅色各读一遍：指示条 / 浅底 / 分界线 / `--series-1` 分别是
+  `#0b0b0b`·`#e4e3db`·`#2a78d6`（浅）与 `#ffffff`·`#2c2c2a`·`#3987e5`（深）——
+  系列色与改版前一致。
+- 控制台无报错，无失败请求；`node --check` 四个 JS 文件全过。
+
+---
+
 ## [2026-09-22] 前端改版：Material 3、分区导航、状态与导出
 
 这一节是页面这一侧的改动，后端接口在下面那一节里。
