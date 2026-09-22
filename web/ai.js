@@ -646,9 +646,37 @@
     els.fMsg.className = 'ai-setup-msg' + (kind ? ` ${kind}` : '');
   }
 
+  /** 密钥在磁盘上是怎么存的 —— **降级到明文必须让用户看得见**。
+   *
+   * 「服务端没说」和「就是明文」得分开：前者不吭声，后者要说重话。
+   * 用户以为自己受着保护、实际是明文，比一开始就知道没加密更糟 ——
+   * 前者会让人放心地把目录拷来拷去。
+   */
+  function renderStorage() {
+    if (!els.fStorage) return;
+    const how = cfg && cfg.key_storage;
+    let text = '';
+    let kind = '';
+    if (how === 'dpapi') {
+      text = '密钥已加密存盘（Windows DPAPI）。密文认这台机器的 Windows 账户 —— '
+           + '文件连同目录一起拷到别处也解不开。';
+      kind = 'ok';
+    } else if (how === 'plain') {
+      text = '注意：密钥是明文存在 ai_config.json 里的 —— 这台机器上用不了 DPAPI。'
+           + '别把这个目录拷给别人。';
+      kind = 'warn';
+    } else if (how === 'env') {
+      text = '密钥来自环境变量 FJC_LLM_KEY，不写进文件。';
+    }
+    els.fStorage.textContent = text;
+    els.fStorage.className = 'ai-setup-storage' + (kind ? ` ${kind}` : '');
+    els.fStorage.hidden = !text;
+  }
+
   /** 把服务端当前的配置回填进表单。密钥**只回填掩码到 placeholder**，value 永远清空。 */
   function fillSetupForm() {
     if (!els.fEndpoint) return;
+    renderStorage();
     els.fEndpoint.value = (cfg && cfg.endpoint) || '';
     els.fModel.value = (cfg && cfg.model) || '';
     if (els.fKey) {
@@ -781,6 +809,7 @@
     els.fEndpoint = byId('ai-f-endpoint');
     els.fModel = byId('ai-f-model');
     els.fKey = byId('ai-f-key');
+    els.fStorage = byId('ai-f-storage');
     els.fSave = byId('ai-f-save');
     els.fTest = byId('ai-f-test');
     els.fClear = byId('ai-f-clear');

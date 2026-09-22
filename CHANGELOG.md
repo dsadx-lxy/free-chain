@@ -6,6 +6,87 @@
 
 ---
 
+## [2026-09-22] 密钥改成加密存盘（Windows DPAPI）
+
+### Security
+
+- **`ai_config.json` 里不再是明文密钥。** 上面「密钥不再随仓库和 zip 一起发出去」
+  那一节做了三件事 —— `.gitignore` 挡住、`git rm --cached` 摘掉、`打包.py` 打完复检
+  —— **但防的都是「这一份别出去」，防不住「它已经出去了」**：目录被拷走、换一种
+  打包方式、进备份、截图、手滑 `git add -f`，穿过任何一样，拿到的都是一把能直接打
+  `api.deepseek.com` 的钥匙。这次改的是最后那一层：**让文件就算漏出去也用不了**。
+- 用 Windows 自带的 **DPAPI**（`crypt32.CryptProtectData`）把密钥加密后写进同一个 JSON
+  的 `key_dpapi` 字段。密文**绑定当前 Windows 账户** —— 拷到别的机器、别的账户底下
+  就是一串解不开的字节。`ctypes` 直接调系统接口，**不引入任何依赖**，
+  「不引 CDN、不引框架、离线可用」这条底线没破。
+- **说清楚它挡什么、不挡什么**（写进 README 与 `ai_secret.py` 的文档）：
+  挡的是**文件被拷到别处**；**挡不住**已经以你的身份在运行的程序 —— 那种程序自己也能调
+  `CryptUnprotectData`。所以它的定位是「把已经发生过的那次泄漏变成无害」，
+  **不是**「密钥从此安全了」。`server.py` 头部「不再往上加权限（认证、多用户、远程访问）」
+  那条理由**一点没变**，注释里补了这一句，免得有人把加密读成「现在可以放开接口了」。
+
+### Added
+
+- `ai_secret.py`：~80 行 ctypes 胶水，`available()` / `protect()` / `unprotect()`，
+  独立成文件是因为 `ai.py` 已经 46KB，而且这一层要被单独 monkeypatch 来测降级路径。
+  **三个函数一律失败返回 `None`，绝不抛异常** —— 叫不动 DPAPI 的机器是降级路径的
+  **正常输入**，一次加密失败不该让「保存配置」这个动作整个失败（那只会逼用户去手写明文）。
+  固定附加熵 `b"fjc-chain/ai_config"`；`CRYPTPROTECT_UI_FORBIDDEN` 保证绝不弹系统对话框
+  （服务是后台跑的，弹窗没人点，只会把进程卡死）；输出用 `LocalFree` 归还。
+- `ai.migrate_config()`：把老文件里的明文 `key` 换成 `key_dpapi`。
+  `main()` 启动时调一次，包在 `try/except` 里 —— **迁移失败绝不能挡住启动**
+  （配置有问题时用户要的正是「起得来，然后去页面上改」）。只换存储方式、**不动密钥本身**，
+  所以不用重填也不用重启；再调一次是空操作。
+- `status.key_storage`：`"dpapi"` / `"plain"` / `"env"` / `null`（没配）。
+  面板密钥框下面多一行小字读它 —— 加密时说 DPAPI，明文时说重话。
+
+### Changed
+
+- `LlmConfig` 新增 `key_storage`（**加在字段最后**，位置参数顺序不动）；
+  `load_config()` 的密钥那一项改走新的 `_key_from_file()`。
+- 向后兼容的判定顺序（这一条就是全部行为，写在 `_key_from_file` 的 docstring 里）：
+  先解 `key_dpapi` → 解不开就**退回文件里同时存在的明文 `key`** 并记一句说明 →
+  只有明文 `key` 就照常用（标成 `"plain"`）。解不开又没有明文时给 `config_error`
+  让人去重填，**不抛异常、服务照常起得来**。
+- `save_config()` 写密钥时改走新的 `_put_key()`：能加密就写 `key_dpapi` 并把明文那项删掉
+  （两个字段并存只会让人分不清哪个在生效）；加不了密就退回明文，
+  **并在 `warnings` 里说明** —— 悄悄退化成明文比不加密更糟。
+  `clear_key` 现在**两个字段都删**：只删一个的话另一个会继续生效，「清除密钥」点了等于没点。
+- 抽出 `_atomic_write()`（原「写 `.tmp` 再 `os.replace`」那段），`save_config` 与
+  `migrate_config` 共用 —— 两处各写一遍迟早只改其中一处。
+- `打包.py` 的 `local_secrets()` 拆出 `key_texts()`，**加密之后 `.get("key")` 永远是 `None`**，
+  照旧只读它这道防线会**静默失效**（少扫一条不报错，只是安静放行，而那正是它存在的理由）。
+  现在两个字段都管：明文直接有，`key_dpapi` 先 `ai_secret.unprotect()` 还原再扫。
+  文件名那一侧的 `SECRET_FILES` 检查不受影响。
+
+### Tests
+
+- `test_ai.py` 新增 `KeyStorageTest`（15 项）：磁盘字节里没有明文（**本次的核心断言**，
+  直接读文件、不看返回值）、真 DPAPI 往返、降级到明文且**确实发了 warning**、
+  老明文文件仍可读、坏密文不抛异常、坏密文 + 明文共存时退回明文、
+  `clear_key` 两个字段都删、迁移幂等 / 加不了密时不动文件、
+  **`protect()` 吐出一串解不回来的字节时宁可什么都不做**（迁移动的是用户唯一一份
+  key，破坏性不能赌）、`status()` 在 dpapi 模式下连密文都不发回浏览器、
+  **`打包.py` 的 `key_texts()` 仍能从 `key_dpapi` 还原出原文**（防它静默失效）。
+- 加密路径靠一对**确定性假 DPAPI**（密文 = `enc:` + 原文）来测，所以在非 Windows 上
+  也跑得动，不依赖真实 `crypt32`；只有两条真 DPAPI 的用例带 `skipUnless`。
+- 原有的 `test_response_and_disk_disagree_never_on_the_key` 里那条
+  「磁盘上必须有明文」的断言**现在是错的**，改成按 `ai_secret.available()` 分叉：
+  能加密就必须没有明文，不能加密就必须有 —— 两条路径都钉住。
+- 合计 **293 项**全过（`test_fjc_core` 127 + `test_ai` 166）。
+
+### Notes
+
+- 特意**不做**的几件事：不引入 Windows 凭据管理器、不引入 `keyring` / `cryptography`
+  之类的第三方库、**不挪配置文件的位置**（仍在 `server.py` 同目录）、
+  不改 `/api/ai/*` 的请求体形状（加密只发生在落盘那一步，前端侧完全不变）。
+- 顺带一提：用户手写的明文 `key` 与页面存的 `key_dpapi` **同时存在时以密文为准**，
+  只有密文解不开才回落到明文。这条写进 README 了。
+- **待用户确认**：那把真实的 DeepSeek key 是否已经去后台吊销（`.gitignore` 只防新的泄漏，
+  阻止不了已经发出去的那一把）。另：`token.txt` 用完该删。
+
+---
+
 ## [2026-09-22] token.txt 也不再随包发出去
 
 ### Security

@@ -42,6 +42,11 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
+try:
+    import ai_secret      # 只为把 DPAPI 密文解回原文用（见 local_secrets）
+except Exception:         # 拿不到就是少扫一条，不该让打包整个失败
+    ai_secret = None
+
 # 排除清单分三类写，改的时候知道自己动的是哪一类。
 SECRET_FILES = {"ai_config.json", "token.txt", ".gh_token"}   # 1) 凭据：这个脚本存在的理由
 JUNK_DIRS = {"__pycache__", "dist", ".git", ".claude", ".idea", ".vscode"}
@@ -80,6 +85,31 @@ def collect(with_slides: bool) -> list[str]:
     return sorted(out)
 
 
+def key_texts(cfg) -> list[str]:
+    """从一个配置字典里抠出所有形态的密钥原文：明文直接有，密文要先解开。
+
+    **加密之后 `.get("key")` 就永远是 None 了。** 照旧只读它，这道检查会
+    **静默失效** —— 少扫一条不报错、不告警，只是安静地放行，而那正是它存在的理由
+    （「凭据被抄进别处」只有这一条查得出来）。所以两个字段都得管：
+    老文件是明文，新文件是 `key_dpapi`，两种都可能出现在这台机器上。
+    """
+    if not isinstance(cfg, dict):
+        return []
+    out = []
+    plain = cfg.get("key")
+    if isinstance(plain, str) and len(plain) >= 8:
+        out.append(plain)
+    blob = cfg.get("key_dpapi")
+    if isinstance(blob, str) and blob.strip() and ai_secret is not None:
+        try:
+            back = ai_secret.unprotect(blob.strip())
+        except Exception:
+            back = None
+        if isinstance(back, str) and len(back) >= 8:
+            out.append(back)
+    return out
+
+
 def local_secrets() -> list[str]:
     """本机凭据的原文：ai_config.json 里的 key + token.txt 里的 token。
 
@@ -90,9 +120,7 @@ def local_secrets() -> list[str]:
     out = []
     try:
         with open(os.path.join(ROOT, "ai_config.json"), encoding="utf-8") as fh:
-            v = json.load(fh).get("key")
-        if isinstance(v, str) and len(v) >= 8:
-            out.append(v)
+            out.extend(key_texts(json.load(fh)))
     except Exception:
         pass
     try:

@@ -38,6 +38,7 @@ from unittest import mock
 
 import ai
 import ai_local
+import ai_secret
 import ai_tools
 import fjc_core
 
@@ -1042,7 +1043,11 @@ class SaveConfigTest(AiTestCase):
 
     def test_response_and_disk_disagree_never_on_the_key(self):
         """保存接口的返回体直接进 HTTP 响应 —— 里面有原文就等于把 key 发回了浏览器。
-        同时磁盘上必须是真的（不能只在响应里说说）。
+        同时磁盘上必须是真的存住了（不能只在响应里说说，重读却拿不回来）。
+
+        2026-09-22 起「磁盘上必须是真的」不再等于「磁盘上必须有明文」：能加密的机器上
+        磁盘里只有密文，这才是本次改动的核心断言。加不了密的机器退回明文 ——
+        两条路径都要认，所以这里按 `ai_secret.available()` 分叉，不写死一种。
         """
         out = ai.save_config(key=FAKE_KEY, endpoint=FAKE_ENDPOINT,
                              model=FAKE_MODEL, path=self.path)
@@ -1050,7 +1055,20 @@ class SaveConfigTest(AiTestCase):
         self.assertNotIn(FAKE_KEY, blob)
         self.assertNotIn(FAKE_KEY[-6:], blob)
         self.assertEqual(out["masked"], "••••" + FAKE_KEY[-4:])
-        self.assertIn(FAKE_KEY, self.path.read_text(encoding="utf-8"))
+
+        text = self.path.read_text(encoding="utf-8")
+        if ai_secret.available():
+            self.assertNotIn(FAKE_KEY, text)
+            self.assertNotIn('"key"', text)          # 明文那一项整个不该在
+            self.assertIn(ai.KEY_DPAPI_FIELD, text)
+            self.assertEqual(out["key_storage"], "dpapi")
+        else:
+            self.assertIn(FAKE_KEY, text)             # 降级路径：确实是明文
+            self.assertEqual(out["key_storage"], "plain")
+            self.assertTrue(out.get("warnings"))      # 而且明确告知了
+
+        # 两条路径共同的部分：磁盘上真的存住了。
+        self.assertEqual(ai.load_config(self.path).key, FAKE_KEY)
 
     def test_an_empty_key_does_not_erase_the_saved_one(self):
         """**这条最重要。** 页面上看不到 key 原文（只有掩码），所以空输入必须是
@@ -1164,6 +1182,238 @@ class SaveConfigTest(AiTestCase):
                 self.assertEqual(cfg.endpoint, p["endpoint"])
                 self.assertTrue(cfg.chat_url().endswith("/chat/completions"))
                 self.assertTrue(cfg.chat_url().startswith("http"))
+
+
+class KeyStorageTest(AiTestCase):
+    """密钥怎么落盘 —— 2026-09-22 起默认是加密的（Windows DPAPI）。
+
+    为什么单开一组：这条改动的**失败方式是静默的**。加密没生效、密文没解回来、
+    降级到明文却没说 —— 三种都不报错，页面照常显示「已配置」，用户会以为自己
+    受着保护。只有直接断言磁盘字节才看得见，光看返回值看不出来。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.tmp / "ai_config.json"
+
+    # --- 假的 DPAPI：让「加密路径」在任何平台上都能测，且不依赖真实 crypt32 ---
+
+    def use_fake_dpapi(self):
+        """密文 = `enc:` + 原文。看得懂、改得坏、和真 DPAPI 一样「离开本进程就没了」。"""
+        self.enter(mock.patch.object(ai_secret, "protect",
+                                     lambda s: "enc:" + s if s else None))
+        self.enter(mock.patch.object(
+            ai_secret, "unprotect",
+            lambda b: b[4:] if isinstance(b, str) and b.startswith("enc:") else None))
+
+    def write(self, obj):
+        self.path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+
+    def raw(self) -> str:
+        return self.path.read_text(encoding="utf-8")
+
+    # --- 核心断言 ---
+
+    @unittest.skipUnless(ai_secret.available(), "这台机器没有 DPAPI（非 Windows）")
+    def test_plaintext_key_never_reaches_the_disk(self):
+        """**本次改动的核心断言**，直接读磁盘字节，不看任何返回值。
+
+        这条要是退化了，整个改动等于没做 —— 而它退化时不会有任何现象。
+        """
+        ai.save_config(key=FAKE_KEY, endpoint=FAKE_ENDPOINT,
+                       model=FAKE_MODEL, path=self.path)
+        text = self.raw()
+        self.assertNotIn(FAKE_KEY, text, "明文密钥进了文件")
+        self.assertNotIn(FAKE_KEY[-6:], text, "密钥尾巴进了文件")
+        self.assertNotIn('"key"', text, "明文那一项还留在文件里")
+        self.assertIn(ai.KEY_DPAPI_FIELD, text, "没看到密文字段，到底存了什么？")
+
+    @unittest.skipUnless(ai_secret.available(), "这台机器没有 DPAPI（非 Windows）")
+    def test_round_trips_through_the_real_dpapi(self):
+        """能存进去还得能取出来，而且标记成 dpapi —— 只有存没有取等于把 key 弄丢了。"""
+        out = ai.save_config(key=FAKE_KEY, endpoint=FAKE_ENDPOINT,
+                             model=FAKE_MODEL, path=self.path)
+        self.assertEqual(out["key_storage"], "dpapi")
+        cfg = ai.load_config(self.path)
+        self.assertEqual(cfg.key, FAKE_KEY)
+        self.assertEqual(cfg.key_storage, "dpapi")
+        self.assertFalse(cfg.config_error)
+
+    def test_env_key_is_marked_env_and_never_touches_the_file(self):
+        with no_env():
+            os.environ["FJC_LLM_KEY"] = FAKE_KEY
+            cfg = ai.load_config(self.path)
+            self.assertEqual((cfg.key, cfg.key_storage), (FAKE_KEY, "env"))
+            self.assertFalse(self.path.exists(), "环境变量那条路不该写文件")
+
+    # --- 降级路径 ---
+
+    def test_degrades_to_plaintext_and_says_so(self):
+        """**降级必须出声。** 用户以为受着保护、实际是明文，比一开始就知道没加密更糟
+        —— 前者会让人放心地把目录拷来拷去。所以这里连 warning 一起钉住。
+        """
+        self.enter(mock.patch.object(ai_secret, "protect", lambda s: None))
+        out = ai.save_config(key=FAKE_KEY, endpoint=FAKE_ENDPOINT,
+                             model=FAKE_MODEL, path=self.path)
+        self.assertEqual(out["key_storage"], "plain")
+        warnings = out.get("warnings") or []
+        self.assertTrue(any("明文" in w for w in warnings),
+                        f"退回明文却没告知用户：{warnings}")
+        # 说是明文的，磁盘上就得真是明文 —— 否则这条 warning 是假的。
+        self.assertIn(FAKE_KEY, self.raw())
+        self.assertNotIn(ai.KEY_DPAPI_FIELD, self.raw())
+        # 降级不等于不能用。
+        self.assertEqual(ai.load_config(self.path).key, FAKE_KEY)
+
+    def test_a_plaintext_file_written_by_hand_still_works(self):
+        """向后兼容：老文件（只有明文 `key`）照常读得出来，只是标记成明文。"""
+        self.write({"key": FAKE_KEY, "endpoint": FAKE_ENDPOINT, "model": FAKE_MODEL})
+        cfg = ai.load_config(self.path)
+        self.assertEqual(cfg.key, FAKE_KEY)
+        self.assertEqual(cfg.key_storage, "plain")
+        self.assertFalse(cfg.config_error)
+        self.assertTrue(cfg.configured)
+        self.assertEqual(cfg.status()["key_storage"], "plain")
+
+    def test_a_corrupt_blob_never_raises(self):
+        """密文被改坏 / 换过 Windows 账户 —— **不能抛异常，服务得起得来**。
+        读不了就说读不了，让人去页面上重填，而不是让整个服务起不来。
+        """
+        for bad in ("这不是 base64！！", "AQAAANCMnd8BFdERjHoAwE", ""):
+            with self.subTest(blob=bad):
+                self.write({"key_dpapi": bad, "endpoint": FAKE_ENDPOINT})
+                cfg = ai.load_config(self.path)
+                self.assertEqual(cfg.key, "")
+                self.assertFalse(cfg.configured)
+                st = cfg.status()                      # 渲染得出来，不炸
+                self.assertNotIn(FAKE_KEY, json.dumps(st))
+                if bad:
+                    self.assertTrue(cfg.config_error, "解不开却什么都没说")
+                else:
+                    # 空串就是「没配」，不是「解不开」—— 不该吓唬用户。
+                    self.assertFalse(cfg.config_error)
+
+    def test_a_corrupt_blob_falls_back_to_a_coexisting_plaintext_key(self):
+        """「整个目录拷到新机器」那一幕：密文没用了，但用户手写的明文还在。
+        这时**用明文并说清楚**，比让他连服务都起不来强。
+        """
+        self.write({"key_dpapi": "坏掉的密文", "key": FAKE_KEY,
+                    "endpoint": FAKE_ENDPOINT, "model": FAKE_MODEL})
+        cfg = ai.load_config(self.path)
+        self.assertEqual(cfg.key, FAKE_KEY)
+        self.assertEqual(cfg.key_storage, "plain")
+        self.assertIn("解不开", cfg.config_error)
+        self.assertTrue(cfg.configured, "能用却报未配置")
+
+    # --- 清除 / 迁移 ---
+
+    def test_clear_key_removes_both_fields(self):
+        """只删一个字段的话，另一个会继续生效 ——「清除密钥」点了等于没点。"""
+        self.use_fake_dpapi()
+        ai.save_config(key=FAKE_KEY, path=self.path)
+        self.assertIn(ai.KEY_DPAPI_FIELD, self.raw())
+
+        out = ai.save_config(clear_key=True, path=self.path)
+        saved = json.loads(self.raw())
+        self.assertNotIn(ai.KEY_FIELD, saved)
+        self.assertNotIn(ai.KEY_DPAPI_FIELD, saved)
+        self.assertFalse(out["configured"])
+        self.assertIsNone(out["key_storage"])
+        self.assertEqual(ai.load_config(self.path).key, "")
+
+    def test_migrate_encrypts_an_old_file_without_changing_the_key(self):
+        """迁移只换存储方式，**不动密钥本身** —— 所以不用用户重填、也不用重启。"""
+        self.use_fake_dpapi()
+        self.write({"key": FAKE_KEY, "endpoint": FAKE_ENDPOINT, "model": FAKE_MODEL})
+
+        msg = ai.migrate_config(self.path)
+        self.assertTrue(msg, "该迁移却没吭声")
+        saved = json.loads(self.raw())
+        self.assertNotIn(ai.KEY_FIELD, saved)
+        self.assertIn(ai.KEY_DPAPI_FIELD, saved)
+        self.assertEqual(ai.load_config(self.path).key, FAKE_KEY)
+        self.assertEqual(ai.load_config(self.path).key_storage, "dpapi")
+
+    def test_migrate_is_a_no_op_the_second_time(self):
+        """再调一次必须是空操作 —— 每次启动都跑它，写来写去没有意义还徒增风险。"""
+        self.use_fake_dpapi()
+        self.write({"key": FAKE_KEY, "endpoint": FAKE_ENDPOINT})
+        ai.migrate_config(self.path)
+        before = self.raw()
+        self.assertIsNone(ai.migrate_config(self.path))
+        self.assertEqual(self.raw(), before)
+
+    def test_migrate_leaves_a_plaintext_file_alone_when_it_cannot_encrypt(self):
+        """加不了密就**别动它**：重写一遍明文没有任何好处。"""
+        self.enter(mock.patch.object(ai_secret, "protect", lambda s: None))
+        self.write({"key": FAKE_KEY, "endpoint": FAKE_ENDPOINT})
+        before = self.raw()
+        self.assertIsNone(ai.migrate_config(self.path))
+        self.assertEqual(self.raw(), before)
+
+    def test_migrate_refuses_to_write_a_blob_it_cannot_read_back(self):
+        """`protect()` 吐出一串解不回来的字节时**什么都不做**。
+
+        迁移是我们主动去改用户唯一一份 key，破坏性不能赌 —— 写进去一串谁也解不开的
+        字节等于把他的 key 弄丢，而且没有任何提示。宁可明文继续用着。
+        """
+        self.enter(mock.patch.object(ai_secret, "protect", lambda s: "不是能解开的密文"))
+        self.write({"key": FAKE_KEY, "endpoint": FAKE_ENDPOINT})
+        before = self.raw()
+        self.assertIsNone(ai.migrate_config(self.path))
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(ai.load_config(self.path).key, FAKE_KEY)
+
+    def test_migrate_does_nothing_when_there_is_no_key(self):
+        for obj in ({}, {"endpoint": FAKE_ENDPOINT},
+                    {"key": ""}, {"key_dpapi": "enc:x"}):
+            with self.subTest(cfg=obj):
+                self.write(obj)
+                self.assertIsNone(ai.migrate_config(self.path))
+
+    # --- 视图层 / 打包脚本不能因为加密而瞎掉 ---
+
+    def test_status_never_carries_the_key_in_dpapi_mode(self):
+        """`status()` 直接进 `GET /api/ai/status` 的响应体。加密之后这条更要紧：
+        密文本身也不该发出去 —— 那是可以离线暴力试的东西。"""
+        self.use_fake_dpapi()
+        out = ai.save_config(key=FAKE_KEY, endpoint=FAKE_ENDPOINT,
+                             model=FAKE_MODEL, path=self.path)
+        blob = json.dumps(out, ensure_ascii=False)
+        self.assertNotIn(FAKE_KEY, blob)
+        self.assertNotIn("enc:" + FAKE_KEY, blob, "密文发回浏览器了")
+        self.assertEqual(out["masked"], "••••" + FAKE_KEY[-4:])
+
+    def test_the_packaging_scanner_still_sees_an_encrypted_key(self):
+        """`打包.py` 靠密钥原文扫包里每一个文本文件。加密之后 `.get("key")` 永远是
+        None —— 照旧只读它，这道防线会**静默失效**（少扫一条不报错，只是安静放行）。
+        这里把「加密了也要还原得出来」钉住。
+        """
+        packer = load_packer()
+        if packer is None:
+            self.skipTest("找不到 打包.py")
+
+        self.use_fake_dpapi()
+        self.write({"key_dpapi": "enc:" + FAKE_KEY})
+        found = packer.key_texts(json.loads(self.raw()))
+        self.assertIn(FAKE_KEY, found, "加密之后打包脚本扫不到密钥原文了")
+
+        # 明文那一侧照旧。
+        self.assertIn(FAKE_KEY, packer.key_texts({"key": FAKE_KEY}))
+        # 短值不算凭据（避免把 `abc` 这种当成密钥满世界报问题）。
+        self.assertEqual(packer.key_texts({"key": "short"}), [])
+
+
+def load_packer():
+    """按路径加载 `打包.py` —— 模块名是中文，也没有包，靠 importlib 找。"""
+    import importlib.util
+    p = Path(__file__).with_name("打包.py")
+    if not p.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("fjc_packer", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestConnectionTest(AiTestCase):

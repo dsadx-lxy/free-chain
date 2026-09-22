@@ -268,6 +268,9 @@ set FJC_LLM_MODEL=deepseek-chat
 `deepseek-chat`；`key` 和 `endpoint` 缺任何一个就算未配置（页面会显示「本地模式」）。
 `"enabled": false` 或 `FJC_LLM_ENABLED=0` 显式关掉网关、强制本地模式。
 
+手写这份文件时 `key` 是明文；**页面上保存的会换成 `key_dpapi` 密文**（见下）。
+两种写法都认，文件里同时有这两个字段时以 `key_dpapi` 为准。
+
 **endpoint 填 base 就行 —— 只往后接 `/chat/completions`，不替你猜 `/v1`。**
 各家的 base 路径差别很大，硬补一个 `/v1` 会把前两家弄坏：
 
@@ -303,6 +306,49 @@ set FJC_LLM_MODEL=deepseek-chat
 （512 / 400 / 200 字）。不合法的请求在碰磁盘之前就被 400 挡下 ——
 所以填错地址不会把一份好配置冲掉。
 
+### 密钥在磁盘上是怎么存的
+
+**页面上保存的密钥是加密的**，用的是 Windows 自带的 DPAPI
+（`crypt32.CryptProtectData`，`ctypes` 直接调，**没有引入任何依赖**）。
+存进去的是 `key_dpapi` 这个字段：
+
+```json
+{
+  "key_dpapi": "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAA…",
+  "endpoint": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat"
+}
+```
+
+密文**绑定当前 Windows 账户**：同一个文件拷到别的机器、别的账户底下就是一串解不开的字节。
+这一条是冲着一件真事去的 —— 这份配置曾经连同两个 zip 一起被发出去过，谁下载谁就拿到一把
+能直接花余额的钥匙（见 `CHANGELOG.md`）。清理历史只能防「这一份再出去」，
+防不住「它已经出去了」：目录被拷走、换个方式打包、进备份、截图，穿过任何一样就没用了。
+加密之后，漏出去的只是一串在别的机器上没用的字节。
+
+**它挡什么、不挡什么** —— 这句别读成「密钥从此安全了」：
+
+- **挡**：文件被拷到别处。换台机器、换个 Windows 账户、被打进包里发出去，都解不开。
+- **不挡**：已经以你的身份在运行的程序。那种程序自己也能调 `CryptUnprotectData`，
+  DPAPI 对它一点阻力都没有。上面「本机任意进程都能打到这些接口」那条代价**没有改变**。
+
+**加不了密的时候会退回明文，并且明确告诉你。** 非 Windows、或者 `crypt32` 调不动的机器上，
+保存仍然成功，但密钥是明文写在 `key` 里的，同时：
+
+- 保存接口的返回里多一条 `warnings`，面板上会显示出来；
+- 面板的密钥框下面那行小字会说「密钥是明文存的」；
+- `GET /api/ai/status` 的 `key_storage` 字段是 `"plain"`（加密时是 `"dpapi"`，
+  来自环境变量时是 `"env"`，没配则是 `null`）。
+
+降级必须出声，是因为**用户以为自己受着保护、实际是明文，比一开始就知道没加密更糟** ——
+前者会让人放心地把目录拷来拷去。
+
+老文件里手写的明文 `key` 照常能读（只是标成 `"plain"`）；**服务启动时会顺手把它换成密文**
+（`ai.migrate_config()`，只换存储方式、不动密钥本身，所以不用你重填，也不用重启）。
+换过 Windows 账户或换过机器导致密文解不开时，服务**不会起不来**：要么退回文件里同时存在的
+明文 `key`，要么在页面上说一句「请在接入设置里重填一次密钥」。
+`server.py` 同目录如果还有 `ai_secret.py`，那是这套加密的实现，独立成文件是为了能被单独测试。
+
 ### 在页面上改，为什么当初说不行、后来又加了
 
 这一节原来是「密钥不进浏览器」。**推翻它的是用户明确要求**（「做一个可以输入 api 接入的前端接口」，
@@ -327,8 +373,9 @@ set FJC_LLM_MODEL=deepseek-chat
 
 真正要保护的不是数据而是**钱** —— 这个接口会去调付费网关。
 
-> `ai_config.json` 里是**明文密钥**。本目录不是 git 仓库，但别把它拷到别处去，
-> 也别连着 key 一起截图发出去。
+> `ai_config.json` 里页面上保存的密钥是**加密的**（DPAPI，见上一节），但**别把它拷到别处去**
+> —— 那份配置里还有 endpoint、model，而且密文只在这台机器、这个 Windows 账户下才解得开。
+> 更别连着 key 一起截图发出去：DPAPI 保护的是文件，不是你的屏幕。
 
 ### 本地模式：没配 key 也能用
 
@@ -507,15 +554,16 @@ fjc-chain/
 ├── ai.py             # AI 助手：配置 + urllib 传输 + agent 循环 + 会话 + 本地兜底
 ├── ai_tools.py       # 工具定义与执行（调 fjc_core，不碰网络）
 ├── ai_local.py       # 本地模式的关键词解析（没配网关时的兜底）
+├── ai_secret.py      # 密钥落盘的加密（Windows DPAPI，ctypes 调 crypt32，无依赖）
 ├── test_fjc_core.py  # 127 项单元测试（物理内核）
-├── test_ai.py        # 151 项单元测试（AI 助手，不联网）
+├── test_ai.py        # 166 项单元测试（AI 助手，不联网）
 ├── CHANGELOG.md      # 每次改动一条
 ├── 启动.cmd
 └── web/              # index.html + app.js + chain3d.js + sweep.js + ai.js + style.css
                       # 无框架、无 CDN、离线可用
 ```
 
-合计 **278 项**测试。
+合计 **293 项**测试。
 
 `ai_config.json`（页面「保存」生成，或自己建）不在上面 —— 里面是密钥，**别提交、别截图**。
 
@@ -541,7 +589,7 @@ D:\anaconda3\python.exe -m unittest test_fjc_core -v
 D:\anaconda3\python.exe -m unittest test_ai -v
 ```
 
-两个文件加起来 **278 项**（`test_fjc_core` 127 + `test_ai` 151）。
+两个文件加起来 **293 项**（`test_fjc_core` 127 + `test_ai` 166）。
 **物理内核与 AI 助手是分开测的** —— AI 那一侧从头到尾只是**调** `fjc_core`，一行也不改它。
 
 测试的核心手法是**解析式 vs scipy 数值积分**：∫P dh = 1、∫h²P dh = nl²、

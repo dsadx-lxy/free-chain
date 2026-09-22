@@ -416,6 +416,10 @@
         <label for="ai-f-key">密钥 key</label>
         <input id="ai-f-key" type="password" spellcheck="false"
                autocomplete="new-password">
+        <!-- 密钥在磁盘上是怎么存的，由 ai.js 按 status.key_storage 填。
+             降级到明文**必须让用户看见** —— 不说的话他会以为自己受着保护，
+             那比一开始就知道没加密更糟（会放心地把目录拷来拷去）。 -->
+        <p id="ai-f-storage" class="ai-setup-storage" hidden></p>
       </div>
 
       <div class="ai-setup-btns">

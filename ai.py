@@ -33,11 +33,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import ai_local
+import ai_secret
 import ai_tools
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_NAME = "ai_config.json"
 DEFAULT_MODEL = "deepseek-chat"
+
+# 配置文件里放密钥的两个字段。**写盘一定优先 DPAPI 那一项**：
+#   key_dpapi —— base64 的 DPAPI 密文（见 ai_secret.py），绑定当前 Windows 账户
+#   key       —— 明文。只为两件事留着：读得懂老文件、让手动建文件的人还能用。
+# 保存时只要有 DPAPI 就把 key 删掉，两个字段不并存。
+KEY_FIELD = "key"
+KEY_DPAPI_FIELD = "key_dpapi"
 
 # 常用网关的 base 地址。**只列 base，不猜 `/v1`** —— chat_url 只往后追加
 # /chat/completions（见那里的注释，智谱是 /api/paas/v4、火山方舟是 /api/v3）。
@@ -111,6 +119,12 @@ class LlmConfig:
     enabled: bool = True
     source: str | None = None        # "env" | "file" | None
     config_error: str = ""           # 配置文件读坏时的原因（不抛异常，只记着）
+    # 密钥**这一份**是怎么存的，给 UI 说人话用：
+    #   "dpapi" —— DPAPI 密文（本机默认，文件拷走也没用）
+    #   "plain" —— 明文（非 Windows，或这台机器上调不动 DPAPI）
+    #   "env"   —— 来自环境变量，压根不落盘
+    # 放在最后：前面几个字段的顺序一个字都别动，改配置是位置参数构造的会静默错位。
+    key_storage: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -134,6 +148,9 @@ class LlmConfig:
             "endpoint": self.endpoint or None,
             "model": self.model or None,
             "masked": self.masked(),
+            # 密钥是加密存的还是明文存的。**必须让用户看得见** —— 降级到明文
+            # 要是不说，用户会以为自己受着 DPAPI 保护，那比不加密更糟。
+            "key_storage": self.key_storage,
             "local_fallback": True,      # 本地兜底一直在，没配网关也能用
             "max_rounds": AI_MAX_ROUNDS,
             # 页面那个「选择服务商」下拉的数据源。放在这里是为了只有一份名单：
@@ -206,6 +223,41 @@ def _read_config_file(path: Path) -> tuple[dict, str]:
     return data, ""
 
 
+def _key_from_file(file_cfg: dict) -> tuple[str, str | None, str]:
+    """从配置字典里取出密钥。返回 (密钥, 存储方式, 出错原因)。
+
+    存储方式是 "dpapi" / "plain" / None（没配）。**这个判定顺序就是全部的向后兼容行为**，
+    别随手调换：
+
+    1. 有 `key_dpapi` 就先解它 —— 那是我们自己写的格式，比明文可信。
+    2. 解不开（换过 Windows 账户、换过机器、文件被改坏）**不抛异常**，而是：
+       同时还有明文 `key` 就用明文并记一句说明；没有就报 `config_error`。
+       这一条是给「把整个目录拷到新机器上」准备的 —— 密文没用了，但用户手写的明文还在，
+       不该让他连服务都起不来。
+    3. 只有明文 `key`（老文件，或在非 Windows 上存的）→ 照常能用，只是标记成明文。
+    """
+    blob = file_cfg.get(KEY_DPAPI_FIELD)
+    if isinstance(blob, str) and blob.strip():
+        plain = ai_secret.unprotect(blob.strip())
+        if plain:
+            return plain, "dpapi", ""
+        fallback = file_cfg.get(KEY_FIELD)
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip(), "plain", (
+                f"{CONFIG_NAME} 里的密钥密文解不开（DPAPI 的密文认当初加密时的 Windows "
+                f"账户，换过账户或换过机器就对不上），这次用了文件里同时存在的明文 "
+                f"{KEY_FIELD}。到页面上重新保存一次，就会换成新机器能解的密文。"
+            )
+        return "", None, (
+            f"{CONFIG_NAME} 里的密钥解不开 —— DPAPI 的密文绑定当初加密时的 Windows 账户，"
+            f"换过账户或换过机器就对不上了。请在助手抽屉的「接入设置」里重填一次密钥。"
+        )
+    plain = file_cfg.get(KEY_FIELD)
+    if isinstance(plain, str) and plain.strip():
+        return plain.strip(), "plain", ""
+    return "", None, ""
+
+
 def load_config(path: Path | None = None) -> LlmConfig:
     """环境变量优先，其次 ai_config.json。每次调用都重读 —— 文件很小，
     这样改完配置不用重启服务。"""
@@ -220,7 +272,15 @@ def load_config(path: Path | None = None) -> LlmConfig:
             return v.strip(), "file"
         return default, None
 
-    key, s1 = pick("FJC_LLM_KEY", "key")
+    # 密钥单独走一条路：文件里它可能是 DPAPI 密文，得先解开（见 _key_from_file）。
+    # 环境变量那一侧不受影响，也压根不落盘。
+    env_key = (os.environ.get("FJC_LLM_KEY") or "").strip()
+    if env_key:
+        key, key_storage, key_err, s1 = env_key, "env", "", "env"
+    else:
+        key, key_storage, key_err = _key_from_file(file_cfg)
+        s1 = "file" if key else None
+
     endpoint, s2 = pick("FJC_LLM_ENDPOINT", "endpoint")
     model, s3 = pick("FJC_LLM_MODEL", "model", DEFAULT_MODEL)
 
@@ -232,7 +292,8 @@ def load_config(path: Path | None = None) -> LlmConfig:
     source = next((s for s in (s1, s2, s3) if s), None)
 
     return LlmConfig(key=key, endpoint=endpoint, model=model,
-                     enabled=enabled, source=source, config_error=err)
+                     enabled=enabled, source=source, config_error=err or key_err,
+                     key_storage=key_storage)
 
 
 def scrub(text: str, key: str) -> str:
@@ -275,6 +336,45 @@ def _check_endpoint(url: str) -> str:
     return url
 
 
+def _atomic_write(target: Path, data: dict) -> None:
+    """把配置字典原子地写进 target。
+
+    **先写临时文件再 `os.replace`**。直接覆盖、写到一半被杀，留下的是**半截 JSON**，
+    而 `_read_config_file` 对坏文件的处理是「当作没配」—— 用户的 key 会无声消失，
+    页面还只是平静地显示「本地模式」。这个失败模式太阴，不值得省那一次 rename。
+
+    `save_config` 和 `migrate_config` 共用这一份，两处各写一遍迟早只改其中一处。
+    """
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ConfigError(f"写不进 {CONFIG_NAME}：{e}") from None
+
+
+def _put_key(data: dict, plain: str) -> bool:
+    """把密钥放进配置字典。返回「是不是加密存的」。
+
+    能加密就一定加密，并把明文那一项删掉 —— 两个字段并存只会让人分不清到底哪个在生效。
+    加不了密（非 Windows、crypt32 调不动）就退回明文，**由调用方负责把这件事告诉用户**
+    （`save_config` 会往 warnings 里塞一条）—— 悄悄退化成明文比不加密更糟。
+    """
+    blob = ai_secret.protect(plain)
+    if blob:
+        data[KEY_DPAPI_FIELD] = blob
+        data.pop(KEY_FIELD, None)
+        return True
+    data[KEY_FIELD] = plain
+    data.pop(KEY_DPAPI_FIELD, None)
+    return False
+
+
 def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
                 path: Path | None = None) -> dict:
     """把页面上填的接入配置写进 ai_config.json。**返回值里永远没有 key 原文。**
@@ -292,11 +392,12 @@ def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
     三条实现上的讲究：
 
     1. **只动这三项**，文件里别的键（`enabled` 之类）原样留着 —— 那可能是用户手加的。
-    2. **先写临时文件再 `os.replace`**。直接覆盖、写到一半被杀，留下的是**半截 JSON**，
-       而 `_read_config_file` 对坏文件的处理是「当作没配」—— 用户的 key 会无声消失，
-       页面还只是平静地显示「本地模式」。这个失败模式太阴，不值得省那一次 rename。
+    2. **密钥加密后落盘**（`_put_key` → `ai_secret`）。DPIAPI 不可用时退回明文，
+       并在 warnings 里说明 —— 用户以为自己受着保护、实际是明文，那比不加密更糟。
     3. **保存成功 ≠ 生效**：环境变量优先于文件。哪几项被环境变量压着必须点名，
        否则页面显示「已保存」而助手还在用旧的那套。
+
+    落盘的原子性在 `_atomic_write` 里，不在这里重复。
     """
     target = path or (BASE_DIR / CONFIG_NAME)
 
@@ -310,10 +411,14 @@ def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
     existing, _err = _read_config_file(target)
     data = dict(existing)
 
+    key_was_plain = False
     if clear_key:
-        data.pop("key", None)
+        # **两个字段都要删** —— 只删一个的话，另一个会继续生效，
+        # 「清除密钥」点了等于没点。
+        data.pop(KEY_FIELD, None)
+        data.pop(KEY_DPAPI_FIELD, None)
     elif k:
-        data["key"] = k
+        key_was_plain = not _put_key(data, k)
     if ep_in is not None:
         if ep_in:
             data["endpoint"] = ep_in
@@ -322,17 +427,7 @@ def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
     if md_in is not None:
         data["model"] = md_in
 
-    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    tmp = target.with_name(target.name + ".tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
-    except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise ConfigError(f"写不进 {CONFIG_NAME}：{e}") from None
+    _atomic_write(target, data)
 
     # 重新读一遍，返回**真正生效**的那份（而不是「我以为写进去的」那份）。
     cfg = load_config(target)
@@ -340,6 +435,13 @@ def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
     out["saved"] = True
 
     warnings: list[str] = []
+    if key_was_plain:
+        # 降级必须出声。用户以为自己受着保护、实际是明文，比一开始就知道没加密更糟 ——
+        # 前者会让人放心地把目录拷来拷去。
+        warnings.append(
+            "这台机器上用不了 Windows DPAPI，密钥是**明文**存在 ai_config.json 里的。"
+            "换台 Windows 机器再存一次就能加密；在那之前别把这个目录拷给别人。"
+        )
     for env_name in CFG_ENV_KEYS:
         if (os.environ.get(env_name) or "").strip():
             warnings.append(
@@ -351,6 +453,38 @@ def save_config(key=None, endpoint=None, model=None, clear_key: bool = False,
     if warnings:
         out["warnings"] = warnings
     return out
+
+
+def migrate_config(path: Path | None = None) -> str | None:
+    """把 `ai_config.json` 里的明文密钥换成密文。启动时调一次。
+
+    只在「文件里确实躺着明文 key」且「这台机器能加密」时才动手，其余一律返回 None ——
+    没什么可做的和做失败了，对调用方是同一件事：什么都不用说。
+
+    返回一句给用户看的话（真的迁移过才有）。**迁移不改变密钥本身**，
+    所以不需要用户再填一次，也不用重启：`load_config` 每次都重读文件。
+
+    启动时顺手做掉这一步，是因为用户没有理由知道「加密」这件事 ——
+    要他自己去页面上点一下「保存」才会加密，那这个改动对老用户等于不存在。
+    """
+    target = path or (BASE_DIR / CONFIG_NAME)
+    data, _err = _read_config_file(target)
+    plain = data.get(KEY_FIELD)
+    if not isinstance(plain, str) or not plain.strip():
+        # 没配密钥，或者已经是密文了（`key` 那时已经被 pop 掉）。
+        return None
+    blob = ai_secret.protect(plain.strip())
+    if not blob or ai_secret.unprotect(blob) != plain.strip():
+        # 加不了密，或者**解回来对不上**。后面那种情况理论上不该发生，
+        # 但这一步是我们主动去改用户唯一一份 key，破坏性不能赌：
+        # 写进去一串谁也解不开的字节，等于把他的 key 弄丢了，而且没有任何提示。
+        # 所以宁可什么都不做 —— 明文继续用着，功能一点不受影响。
+        return None
+    data.pop(KEY_FIELD, None)
+    data[KEY_DPAPI_FIELD] = blob
+    _atomic_write(target, data)
+    return (f"{CONFIG_NAME} 里的密钥已改为加密存储（Windows DPAPI）。"
+            f"密文认这台机器的 Windows 账户，文件拷到别处也解不开。")
 
 
 def test_connection(key=None, endpoint=None, model=None) -> dict:
