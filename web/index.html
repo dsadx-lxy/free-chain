@@ -1,5 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<!-- data-theme 写在 <html> 上而不是等 JS 来设：默认深色，且**首帧就是深色** ——
+     交给脚本设的话，浅色的底会先闪一下再翻过去。用户在页面上选的深浅色记在
+     localStorage 里，由 app.js 在启动时覆盖这个属性。 -->
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,6 +11,12 @@
 </head>
 <body>
 <div class="viz-root">
+
+  <!-- 背景节点网络：纯装饰的一层底纹（position:fixed + z-index:-1，不吃布局）。
+       为什么是节点加连线见 web/backdrop.js 的文件头 —— 那正好是这个软件自己的
+       视觉隐喻。它不画任何数据、不参与任何计算，所以 aria-hidden。
+       放在 .viz-root 里面：--net-* 那几个颜色 token 定义在 .viz-root 上。 -->
+  <canvas id="bg-canvas" aria-hidden="true"></canvas>
 
   <!-- 分区导航。同一份标记两种形态（见 style.css 的 .side-nav）：
        ≥900px 是**左侧竖排 rail**，占 grid 第一列，正文整体右移；
@@ -82,65 +91,117 @@
 
     <div id="alerts" class="alerts" role="status" aria-live="polite"></div>
 
-    <!-- Kuhn 长度预置：把 l 填到正确量级的一条捷径。
-         表本身**只有** fjc_core.KUHN_PRESETS 一份，这里由 app.js 从 /api/kuhn 拉，
-         JS 里不再抄第二份 —— 抄了就会改一处忘一处，两个表各说各话。 -->
-    <section class="card" id="kuhn-card" aria-labelledby="kuhn-title">
+    <!-- 链模型：**下面所有东西都跟着它走** —— 统计量、P(h)、3D 构象、链长扫描、
+         数值表、以及 AI 助手。四个模型的定义只写在 fjc_core 里一处，
+         这里的选项、公式、说明、参数范围全部从 GET /api/models 拉（和 /api/kuhn 同一个路子），
+         JS 不抄第二份。参数字段按模型显隐：自由旋转链要键角、受累旋转链再多一个
+         ⟨cosφ⟩、蠕虫状链改用持久长度 p。 -->
+    <section class="card" id="model-card" aria-labelledby="model-title">
       <div class="card-head">
-        <h2 id="kuhn-title">Kuhn 长度预置（真实高分子）</h2>
-        <button id="kuhn-clear" class="outlined-btn" type="button">回到 l = 1</button>
+        <h2 id="model-title">链模型</h2>
+        <div class="legend" id="model-readout" hidden></div>
       </div>
-      <div class="chips kuhn-chips" id="kuhn-chips" role="group"
-           aria-labelledby="kuhn-title" hidden></div>
-      <div class="readout" id="kuhn-readout" hidden></div>
-      <p class="chart-note" id="kuhn-note">
-        点一个就把顶部的 <span class="m">l</span> 填成它的 Kuhn 长度 <span class="m">b</span>，
-        于是结果的单位跟着变成 nm。
-      </p>
-    </section>
-
-    <!-- h → n 反解：正向是「给 n 求 h」，这里是反过来。必须说清是哪一种 h ——
-         h_rms 和 nl 在同一个 n 下差一到两个数量级，只说「要 100」没有意义。 -->
-    <section class="card" id="solve-card" aria-labelledby="solve-title">
-      <div class="card-head">
-        <h2 id="solve-title">由末端距反解链段数 <span class="m">h → n</span></h2>
-      </div>
-      <div class="chain-controls solve-controls">
-        <div class="field field-sm">
-          <label class="field-label" for="sol-h">目标末端距 <span class="m">h</span></label>
-          <input id="sol-h" type="text" inputmode="decimal" placeholder="37" autocomplete="off"
-                 aria-describedby="solve-note">
-        </div>
+      <div class="chain-controls model-controls">
         <div class="field">
-          <label class="field-label" for="sol-kind">这个 <span class="m">h</span> 指的是</label>
-          <select id="sol-kind">
-            <option value="h_rms" selected>根均方末端距 h_rms（= l√n，精确）</option>
-            <option value="h_mean">平均末端距 ⟨h⟩</option>
-            <option value="h_mp">最可几末端距 h*</option>
-            <option value="h_max">全伸展长度 n·l</option>
+          <label class="field-label" for="in-model">模型</label>
+          <select id="in-model" autocomplete="off">
+            <option value="fjc" selected>自由连接链 FJC</option>
           </select>
         </div>
+        <label class="field field-sm" id="theta-wrap" hidden>
+          <span class="field-label">键角 θ（度）</span>
+          <input id="in-theta" type="text" inputmode="decimal" value="109.47" autocomplete="off">
+        </label>
+        <label class="field field-sm" id="cosphi-wrap" hidden>
+          <span class="field-label">内旋转平均余弦</span>
+          <input id="in-cosphi" type="text" inputmode="decimal" value="0.5" autocomplete="off">
+        </label>
+        <label class="field field-sm" id="p-wrap" hidden>
+          <span class="field-label">持久长度（以链段长度为单位）</span>
+          <input id="in-p" type="text" inputmode="decimal" value="10" autocomplete="off">
+        </label>
         <div class="btn-row">
-          <button id="sol-run" class="btn-primary" type="button">反解</button>
-          <button id="sol-use" class="tonal-btn" type="button" disabled>用 ⌈n⌉ 作为 n</button>
+          <button id="model-default" class="outlined-btn" type="button">恢复本模型默认值</button>
         </div>
       </div>
-      <div id="solve-alerts" class="alerts" role="status" aria-live="polite"></div>
-      <div class="readout" id="solve-readout" hidden></div>
-      <p class="chart-note" id="solve-note">
-        <span class="m">l</span> 取顶部参数行的值。注意方向和统计量那边相反：
-        这里 <span class="m">n ∝ (h/l)²</span>，<span class="m">l</span> 翻倍，同一个 <span class="m">h</span>
-        只需要 <span class="m">1/4</span> 的链段数。
-      </p>
+      <div id="model-alerts" class="alerts" role="status" aria-live="polite"></div>
+      <p class="chart-note" id="model-formula">⟨h²⟩ = n·l²　Cn ≡ 1</p>
+      <p class="chart-note" id="model-note"></p>
     </section>
 
-    <section class="hero" id="hero" aria-label="主结果">
-      <div class="hero-label" id="hero-label">根均方末端距</div>
-      <div class="hero-value" id="hero-value">–</div>
-      <div class="hero-formula" id="hero-formula"></div>
-    </section>
+    <!-- 输入区两张卡成组：够宽就并排，不够宽自己落成一列（见 style.css 的 .pair）。
+         成组是为了「宽屏别空着、窄屏别挤」是同一条规则的两个方向，
+         而不是另写一套窄屏版式 —— 那样改一处忘一处是迟早的事。 -->
+    <div class="pair pair-input">
 
-    <section class="tiles" id="tiles" aria-label="统计量"></section>
+      <!-- Kuhn 长度预置：把 l 填到正确量级的一条捷径。
+           表本身**只有** fjc_core.KUHN_PRESETS 一份，这里由 app.js 从 /api/kuhn 拉，
+           JS 里不再抄第二份 —— 抄了就会改一处忘一处，两个表各说各话。 -->
+      <section class="card" id="kuhn-card" aria-labelledby="kuhn-title">
+        <div class="card-head">
+          <h2 id="kuhn-title">Kuhn 长度预置</h2>
+          <button id="kuhn-clear" class="outlined-btn" type="button">回到 l = 1</button>
+        </div>
+        <div class="chips kuhn-chips" id="kuhn-chips" role="group"
+             aria-labelledby="kuhn-title" hidden></div>
+        <div class="readout" id="kuhn-readout" hidden></div>
+        <p class="chart-note" id="kuhn-note">
+          点一个就把顶部的 <span class="m">l</span> 填成它的 Kuhn 长度 <span class="m">b</span>，
+          于是结果的单位跟着变成 nm。
+        </p>
+      </section>
+
+      <!-- h → n 反解：正向是「给 n 求 h」，这里是反过来。必须说清是哪一种 h ——
+           h_rms 和 nl 在同一个 n 下差一到两个数量级，只说「要 100」没有意义。 -->
+      <section class="card" id="solve-card" aria-labelledby="solve-title">
+        <div class="card-head">
+          <h2 id="solve-title">由末端距反解链段数 <span class="m">h → n</span></h2>
+        </div>
+        <div class="chain-controls solve-controls">
+          <div class="field field-sm">
+            <label class="field-label" for="sol-h">目标末端距 <span class="m">h</span></label>
+            <input id="sol-h" type="text" inputmode="decimal" placeholder="37" autocomplete="off"
+                   aria-describedby="solve-note">
+          </div>
+          <div class="field">
+            <label class="field-label" for="sol-kind">这个 <span class="m">h</span> 指的是</label>
+            <select id="sol-kind">
+              <option value="h_rms" selected>根均方末端距 h_rms（= l√n，精确）</option>
+              <option value="h_mean">平均末端距 ⟨h⟩</option>
+              <option value="h_mp">最可几末端距 h*</option>
+              <option value="h_max">全伸展长度 n·l</option>
+            </select>
+          </div>
+          <div class="btn-row">
+            <button id="sol-run" class="btn-primary" type="button">反解</button>
+            <button id="sol-use" class="tonal-btn" type="button" disabled>用 ⌈n⌉ 作为 n</button>
+          </div>
+        </div>
+        <div id="solve-alerts" class="alerts" role="status" aria-live="polite"></div>
+        <div class="readout" id="solve-readout" hidden></div>
+        <p class="chart-note" id="solve-note">
+          <span class="m">l</span> 取顶部参数行的值。注意方向和统计量那边相反：
+          这里 <span class="m">n ∝ (h/l)²</span>，<span class="m">l</span> 翻倍，同一个 <span class="m">h</span>
+          只需要 <span class="m">1/4</span> 的链段数。
+        </p>
+      </section>
+
+    </div>
+
+    <!-- 主结果与七个统计量成组：**保持上下**，不并排 ——
+         主结果是一条铺满整行的「大字 + 右侧推导式」横带，七张统计卡在整行里
+         正好排成一排；硬拆成左右两栏，两边反而各自空出一块。 -->
+    <div class="pair pair-result">
+
+      <section class="hero" id="hero" aria-label="主结果">
+        <div class="hero-label" id="hero-label">根均方末端距</div>
+        <div class="hero-value" id="hero-value">–</div>
+        <div class="hero-formula" id="hero-formula"></div>
+      </section>
+
+      <section class="tiles" id="tiles" aria-label="统计量"></section>
+
+    </div>
   </section>
 
   <!-- ============ 分区二：可视化 ============ -->
@@ -148,14 +209,14 @@
     <div class="section-head">
       <h2 id="sec-viz-t">可视化</h2>
       <p class="section-lede">
-        左边是<strong>系综分布</strong> P(h)，右边是<strong>一次随机实现</strong>的构象 ——
+        左边是这条链<strong>所有可能形状的分布</strong>，右边是<strong>随机走出来的一条</strong> ——
         两者说的不是同一件事，所以宽屏下特意让它们同屏。
       </p>
     </div>
 
     <div class="layout">
 
-    <section class="card">
+    <section class="card" id="ph-card">
       <div class="card-head">
         <h2 id="chart-title">末端距分布 P(h)</h2>
         <div class="card-tools">
@@ -174,9 +235,9 @@
       </p>
     </section>
 
-    <section class="card">
+    <section class="card" id="chain-card">
       <div class="card-head">
-        <h2 id="chain-title">单链构象（一次实现）</h2>
+        <h2 id="chain-title">链构象</h2>
         <div class="legend" id="chain-legend" hidden></div>
       </div>
 
@@ -186,7 +247,7 @@
           <input id="c-n" type="text" inputmode="numeric" value="1000" autocomplete="off">
         </label>
         <label class="field field-sm">
-          <span class="field-label">链数</span>
+          <span class="field-label">画几条链</span>
           <input id="c-chains" type="text" inputmode="numeric" value="1" autocomplete="off">
         </label>
         <label class="field field-sm">
@@ -196,6 +257,31 @@
         <label class="check">
           <input id="c-grid" type="checkbox" checked>
           <span>网格</span>
+        </label>
+        <!-- 把顶部参数行的**参数**导进来：链段数 n 取第一个值，画几条链取 n 的个数。
+             勾上时这两个输入框由上面驱动（会置灰）；超过 3D 的绘制上限时不跟，
+             并在下面说明原因。 -->
+        <label class="check">
+          <input id="c-follow" type="checkbox" checked>
+          <span>跟随上面的参数</span>
+        </label>
+        <!-- 显示开关：坐标框那一项同时管着刻度数字、三轴指示器和网格底板
+             （地板上的格子仍旧由上面那个「网格」勾选单独控制）。 -->
+        <label class="check">
+          <input id="c-axis" type="checkbox" checked>
+          <span>坐标框</span>
+        </label>
+        <label class="check">
+          <input id="c-sphere" type="checkbox" checked>
+          <span>参考球</span>
+        </label>
+        <label class="check">
+          <input id="c-kuhn" type="checkbox" checked>
+          <span>Kuhn 刻度</span>
+        </label>
+        <label class="check">
+          <input id="c-hud" type="checkbox" checked>
+          <span>读数</span>
         </label>
         <div class="btn-row">
           <button id="c-new" class="tonal-btn" type="button">换一条</button>
@@ -243,7 +329,7 @@
          采样数组里读，前端一个公式都不写。 -->
     <section class="card" id="force-card" aria-labelledby="force-title">
       <div class="card-head">
-        <h2 id="force-title">力–伸长曲线（Langevin）</h2>
+        <h2 id="force-title">力–伸长曲线</h2>
         <div class="card-tools">
           <!-- 两条线（一条数据、一条参考）→ 图例常驻，不随曲线数隐藏 -->
           <div class="legend" id="force-legend">
@@ -287,9 +373,9 @@
       </p>
     </section>
 
-    <section class="card">
+    <section class="card" id="sweep-card">
       <div class="card-head">
-        <h2 id="sweep-title">链长扫描：⟨R²⟩ 随 n 怎么长</h2>
+        <h2 id="sweep-title">链长扫描：链变长时末端距怎么变</h2>
         <div class="card-tools">
           <div class="legend" id="sweep-legend" hidden></div>
           <button id="s-png" class="outlined-btn" type="button" disabled>PNG</button>
@@ -333,6 +419,41 @@
         这是一次统计测量，不点「运行模拟」就不会算。鼠标悬停圆点可读数，聚焦后按 ←/→ 逐个看。
       </p>
     </section>
+
+    <!-- 模型指纹：两张**纯理论**曲线（不采样），回答「四个模型的差别从哪来」。
+         数据来自 POST /api/model-curves —— 唯一那份在 fjc_core.model_fingerprint()，
+         前端只负责画。 -->
+    <section class="card" id="fingerprint-card" aria-labelledby="fingerprint-title">
+      <div class="card-head">
+        <h2 id="fingerprint-title">模型指纹</h2>
+        <div class="legend" id="fp-legend" hidden></div>
+      </div>
+      <div class="layout">
+        <div>
+          <div class="chart-body" id="corr-body">
+            <svg id="corr-chart" viewBox="0 0 600 320" role="img" tabindex="0"
+                 aria-labelledby="corr-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="corr-title">方向关联</strong>：隔 k 个链段以后，两个键还指得多一致。
+            自由连接链隔一段就彻底不相关（直接掉到 0）、自由旋转链按 cosθ 逐段衰减、
+            受阻旋转链是「先升后抖」（内旋转把平面朝向也带进了关联）、
+            蠕虫状链衰减最慢 —— 衰减长度就是持久长度。四个模型的差别全从这里来。
+          </p>
+        </div>
+        <div>
+          <div class="chart-body" id="cn-body">
+            <svg id="cn-chart" viewBox="0 0 600 320" role="img" tabindex="0"
+                 aria-labelledby="cn-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="cn-title">Cn 随链长的收敛</strong>：横轴是链段数 n（对数），
+            虚线是长链极限 C∞。有限 n 时的 Cn 总是更小，差的那一项是 O(1/n) ——
+            教科书那个数只在长链极限下才出现，别把有限 n 的值当成算错了。
+          </p>
+        </div>
+      </div>
+    </section>
   </section>
 
   <!-- ============ 分区四：数值表 ============ -->
@@ -356,6 +477,10 @@
   </section>
 
   <footer class="foot">
+    <div class="btn-row">
+      <button id="reset-layout" class="outlined-btn" type="button">恢复默认布局</button>
+      <span class="hint">把模块的拖动过的尺寸和顺序都清掉，回到出厂排布</span>
+    </div>
     自由连接链模型（Freely Jointed Chain）。⟨h²⟩ = n·l² 对 FJC 是精确解；
     分布 P(h) 用 n 较大时的高斯近似。长度单位随 <span class="m">l</span>，默认 l = 1 时结果以链段长度为单位。
     改动记录见仓库根目录的 <code>CHANGELOG.md</code>。
@@ -457,8 +582,10 @@
 
 </div>
 <script src="app.js"></script>
+<script src="backdrop.js"></script>
 <script src="chain3d.js"></script>
 <script src="sweep.js"></script>
+<script src="models.js"></script>
 <script src="ai.js"></script>
 </body>
 </html>

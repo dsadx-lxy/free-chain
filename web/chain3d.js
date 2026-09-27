@@ -14,18 +14,42 @@
 
 (function () {
   const BANDS = 8;                        // 纵深分带数（画家算法的粒度）
-  const MARGIN = 34;                      // 画布内边距（CSS 像素）
+  /* 画布内边距。刻度数字挂在轴外侧 15px 处、再要占掉半行字（十来像素），
+     所以边上至少得留 40px 出头；34 在画布变矮变宽之后会把最外面那排数字顶出画布。 */
+  const MARGIN = 48;
   const DRAG_MAX_SEGMENTS = 20000;        // 拖拽时最多画这么多段，超了就抽稀
   const ANIM_MS = 2500;                   // 生长动画总时长，与 n 无关
   const DEF = { azim: -Math.PI / 3, elev: (20 * Math.PI) / 180, zoom: 1 };
   const FONT = '12px system-ui, "Segoe UI", "Microsoft YaHei", sans-serif';
 
   const $ = (id) => document.getElementById(id);
+  /** 读一个显示开关。控件不在页面上时按「开」处理 —— 宁可多画一点，
+   *  也不要在缺一个复选框时整张图变得什么都没有。 */
+  const opt = (id) => { const e = $(id); return e ? e.checked : true; };
+
+  /** 把任意 CSS 颜色规范化成 [r,g,b]：先写进 canvas 的 fillStyle 再读回来，
+   *  hex / rgb() / 命名色都能吃，不用自己写一堆解析分支。 */
+  function toRGB(ctx, css) {
+    ctx.fillStyle = '#000000';
+    ctx.fillStyle = css;
+    const s = ctx.fillStyle;
+    if (s[0] === '#') {
+      return [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16)];
+    }
+    const m = (s.match(/\d+/g) || [0, 0, 0]).map(Number);
+    return [m[0], m[1], m[2]];
+  }
+
+  function mix(a, b, t) {
+    return `rgb(${Math.round(a[0] + (b[0] - a[0]) * t)},`
+      + `${Math.round(a[1] + (b[1] - a[1]) * t)},${Math.round(a[2] + (b[2] - a[2]) * t)})`;
+  }
 
   const view = { azim: DEF.azim, elev: DEF.elev, zoom: DEF.zoom };
   const state = {
     data: null,
     grid: true,
+    sel: 0,        // 当前查看的是第几条链（0 起）—— 对照面板、图例高亮、加粗都看它
     frac: 1,          // 生长动画进度：1 = 完整链
     animId: null,
     drag: null,
@@ -51,6 +75,8 @@
       ink: g('--text-primary'),
       secondary: g('--text-secondary'),
       muted: g('--text-muted'),
+      accent: g('--accent'),
+      accent2: g('--accent-2'),
       series: [1, 2, 3, 4, 5].map((i) => g(`--series-${i}`)),
     };
   }
@@ -305,10 +331,35 @@
    * 按深度分带、由远及近描边：8 次 stroke() 换来真实的纵深读感，代价可以忽略。
    * 远的细而淡、近的粗而实，和 matplotlib 那种一根匀线的观感差别很大。
    */
-  function drawChain(ctx, cam, flat, nseg, color, dr, step, thin) {
+  function drawChain(ctx, cam, flat, nseg, color, color2, dr, step, thin, bold) {
     const { px, py, pd } = projectChain(cam, flat, nseg);
     const [lo, hi] = dr;
     const span = hi - lo || 1;
+    /* 单链时沿链做一次颜色过渡（起点色 → 终点色，和起止标记同一套语义）；
+       多链时**保持纯色** —— 那几条链的颜色是用来区分「哪条是哪条」的，
+       再叠一层渐变就把身份信息搅浑了。 */
+    const NB = color2 ? 6 : 1;
+    const rgb1 = color2 ? toRGB(ctx, color) : null;
+    const rgb2 = color2 ? toRGB(ctx, color2) : null;
+
+    /* 一层「光晕」：同一根线先用几倍线宽、很低的不透明度铺一遍，再把实线压上去。
+       它不参与任何数据表达（颜色和线宽仍然只由深度决定），纯粹让线看起来是发光的。
+       实线那一遍完全不碰透明度 —— 原因见下面那段注释（alpha 会把已校验的
+       系列色对比度拉到可读下限以下）。 */
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = bold ? 0.22 : (thin ? 0.07 : 0.12);
+    ctx.lineWidth = bold ? 6 : (thin ? 3.5 : 4.5);
+    ctx.beginPath();
+    for (let i = 0; i < nseg; i += step) {
+      const j = Math.min(i + step, nseg);
+      ctx.moveTo(px[i], py[i]);
+      ctx.lineTo(px[j], py[j]);
+    }
+    ctx.stroke();
+    ctx.restore();
 
     const buckets = [];
     for (let b = 0; b < BANDS; b++) buckets.push([]);
@@ -322,7 +373,6 @@
 
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.strokeStyle = color;
     for (let b = 0; b < BANDS; b++) {
       const segs = buckets[b];
       if (!segs.length) continue;
@@ -332,17 +382,154 @@
       // 而且 alpha 混合会把已验证的系列色对比度拉到 1.8:1 —— 低于可读下限。
       // 线宽不改变颜色，对比度恒定，纵深照样读得出来。
       ctx.globalAlpha = 0.82 + 0.18 * f;
-      ctx.lineWidth = thin ? 1.1 : 1.1 + 1.1 * f;
-      ctx.beginPath();
-      for (const i of segs) {
-        const j = Math.min(i + step, nseg);
-        ctx.moveTo(px[i], py[i]);
-        ctx.lineTo(px[j], py[j]);
+      // 选中的那条靠**线宽与光晕**区分，不去调淡别的链 ——
+      // 系列色是验过对比度的，把它们压暗会掉到可读下限以下。
+      ctx.lineWidth = bold ? 1.9 + 1.6 * f : (thin ? 1.1 : 1.1 + 1.1 * f);
+      for (let q = 0; q < NB; q++) {
+        const from = (q * nseg) / NB;
+        const to = ((q + 1) * nseg) / NB;
+        let drew = false;
+        ctx.strokeStyle = color2 ? mix(rgb1, rgb2, (q + 0.5) / NB) : color;
+        ctx.beginPath();
+        for (const i of segs) {
+          if (i < from || i >= to) continue;
+          const j = Math.min(i + step, nseg);
+          ctx.moveTo(px[i], py[i]);
+          ctx.lineTo(px[j], py[j]);
+          drew = true;
+        }
+        if (drew) ctx.stroke();
       }
-      ctx.stroke();
     }
     ctx.globalAlpha = 1;
     return { px, py };
+  }
+
+  /* ---------------- 参考几何：h_rms 球、Kuhn 刻度、三轴 ---------------- */
+
+  /** h_rms 参考球 —— 三条大圆（xy / xz / yz）拼出来的球骨架。
+   *
+   *  这是这张图最值得加的一笔：单条链的 R 偏离 h_rms 是**正常涨落**，
+   *  可「偏多少算正常」光看数字没有几何感。把半径 h_rms 的球画出来，一眼就能
+   *  看到终点落在球面附近；多条链时更能看出这一簇是围着球面散开的。
+   *  虚线的语义和别的图里的阈值线一致：参考量、不是数据。
+   */
+  function drawRefSphere(ctx, cam, radius) {
+    const c = state.colors;
+    const N = 96;
+    ctx.save();
+    ctx.setLineDash([3, 4]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = c.accent;
+    ctx.globalAlpha = 0.45;
+    for (const plane of [0, 1, 2]) {
+      ctx.beginPath();
+      for (let i = 0; i <= N; i++) {
+        const a = (i / N) * Math.PI * 2;
+        const u = radius * Math.cos(a);
+        const v = radius * Math.sin(a);
+        const p = plane === 0 ? proj(cam, u, v, 0)
+          : plane === 1 ? proj(cam, u, 0, v)
+            : proj(cam, 0, u, v);
+        if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const at = proj(cam, radius * 0.7071, -radius * 0.7071, 0);
+    ctx.save();
+    ctx.font = FONT;
+    ctx.fillStyle = c.accent;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`h_rms = ${fmt(radius)}`, at.x + 6, at.y);
+    ctx.restore();
+  }
+
+  /** 每走过一个 Kuhn 长度 b 就在链上点一个小点 —— 让「等价 Kuhn 长度」看得见。
+   *  b/l < 2 时不画：FJC 的 b 就是一个链段，每段都点等于什么都没说。 */
+  function drawKuhnMarks(ctx, cam, flat, nseg, every) {
+    const c = state.colors;
+    ctx.save();
+    ctx.fillStyle = c.accent2;
+    ctx.globalAlpha = 0.9;
+    for (let i = every; i <= nseg; i += every) {
+      const p = proj(cam, flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /** 右下角的三轴指示器（随视角旋转）。3D 图最容易迷路的就是「现在转到哪了」。 */
+  function drawGizmo(ctx, w, h) {
+    const c = state.colors;
+    const b = basis();
+    const ox = w - 46;
+    const oy = h - 38;
+    const L = 21;
+    const axes = [
+      ['x', [1, 0, 0], c.series[0]],
+      ['y', [0, 1, 0], c.series[2]],
+      ['z', [0, 0, 1], c.series[3]],
+    ];
+    ctx.save();
+    ctx.font = FONT;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = 'round';
+    for (const [name, v, color] of axes) {
+      const dx = (v[0] * b.right[0] + v[1] * b.right[1] + v[2] * b.right[2]) * L;
+      const dy = -(v[0] * b.up[0] + v[1] * b.up[1] + v[2] * b.up[2]) * L;
+      ctx.globalAlpha = 0.85;
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(ox + dx, oy + dy);
+      ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.fillText(name, ox + dx * 1.3, oy + dy * 1.3);
+    }
+    ctx.restore();
+  }
+
+  /** 左上角的 HUD 读数：模型、规模、本次实现的 R 与它和理论值的比。
+   *  数字直接写在图上，看图就不用回头翻对照面板（导出的 PNG 也一样带着）。 */
+  function drawHud(ctx, d) {
+    const c = state.colors;
+    const label = (d.params && d.params.label) || '';
+    const rows = [ `${label}　n = ${d.n}　l = ${fmt(d.l)}` ];
+    if (d.chains > 1) {
+      const r2 = d.R2_mean / d.R2_theory;
+      rows.push(`R₁ = ${fmt(d.R_mag[0])}　h_rms = ${fmt(d.h_rms)}`);
+      rows.push(`⟨R²⟩ / ⟨h²⟩ = ${fmt(r2)}（${d.chains} 条链）`);
+    } else {
+      rows.push(`R = ${fmt(d.R_mag[0])}　h_rms = ${fmt(d.h_rms)}`);
+      rows.push(`R / h_rms = ${fmt(d.R_mag[0] / d.h_rms)}`);
+    }
+    ctx.save();
+    ctx.font = FONT;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    /* 先垫一层半透明底再写字。坐标轴的数字是挂在盒角外侧的，投影一转就可能
+       正好转到左上角来 —— 没有这层底，两段文字会叠在一起谁也看不清。
+       底衬比文字大一圈，所以它同时也把 HUD 框成了一块「仪表读数」。 */
+    const padX = 7;
+    const padY = 5;
+    const widest = Math.max(...rows.map((t) => ctx.measureText(t).width));
+    ctx.fillStyle = c.surface;
+    ctx.globalAlpha = 0.72;
+    ctx.beginPath();
+    ctx.rect(MARGIN - 28 - padX, MARGIN - 34 - padY,
+             widest + padX * 2, rows.length * 15 + padY * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = c.secondary;
+    rows.forEach((t, i) => ctx.fillText(t, MARGIN - 28, MARGIN - 34 + i * 15));
+    ctx.restore();
   }
 
   /* ---------------- 主绘制 ---------------- */
@@ -369,10 +556,22 @@
     ctx.fillRect(0, 0, w, h);
 
     const box = boundsOf(d.points);
+    // 参考球的半径也要算进取景框，否则球会被画到画布外面（n 小的时候尤其明显）
+    const hr = Number(d.h_rms) || 0;
+    const showSphere = opt('c-sphere');
+    if (showSphere) {
+      for (let k = 0; k < 3; k++) {
+        box.min[k] = Math.min(box.min[k], -hr);
+        box.max[k] = Math.max(box.max[k], hr);
+      }
+    }
     const cam = makeCam(box, w, h);
     const ticks = [0, 1, 2].map((k) => axisTicks(box.min[k], box.max[k], 4));
 
-    drawFrame(ctx, cam, box, ticks);
+    // 坐标框（含刻度、网格底板、三轴指示器）可以整体关掉 —— 只想看构象时干净
+    const showAxis = opt('c-axis');
+    if (showAxis) drawFrame(ctx, cam, box, ticks);
+    if (showSphere) drawRefSphere(ctx, cam, Math.max(hr, 1e-9));
 
     const nseg = state.frac >= 1
       ? d.n
@@ -404,7 +603,38 @@
 
     const screen = [];
     for (let ci = 0; ci < d.chains; ci++) {
-      screen.push(drawChain(ctx, cam, d.points[ci], nseg, c.series[ci % 5], dr, step, thin));
+      // 只有一条链时才做沿链渐变（多链时颜色要留给「哪条链」）：
+      // 起点用 series[2]、终点用 series[1]，和下面的起止标记同一套色
+      const single = d.chains === 1;
+      screen.push(drawChain(ctx, cam, d.points[ci], nseg, c.series[ci % 5],
+                            single ? c.series[1] : null, dr, step, thin,
+                            ci === state.sel));
+    }
+    state.cam = cam;        // 画布点击要用它做命中判断（找离点击处最近的那条链）
+
+    // 生长动画的头部：一个会发光的点，动画走着的时候一眼看得到「头」在哪
+    if (state.frac < 1) {
+      const s = screen[0];
+      const tip = Math.min(d.n, Math.max(1, Math.round(state.frac * d.n)));
+      const g = ctx.createRadialGradient(s.px[tip], s.py[tip], 0, s.px[tip], s.py[tip], 15);
+      g.addColorStop(0, 'rgba(255,255,255,0.9)');
+      g.addColorStop(0.4, c.accent);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.save();
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(s.px[tip], s.py[tip], 15, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Kuhn 刻度：b/l ≥ 2 才有意义（FJC 的 b 就是一个链段）
+    const kuhnEvery = Math.round((Number(d.kuhn_length) || 0) / (Number(d.l) || 1));
+    if (opt('c-kuhn') && kuhnEvery >= 2 && state.frac >= 1) {
+      for (let ci = 0; ci < d.chains; ci++) {
+        drawKuhnMarks(ctx, cam, d.points[ci], nseg, kuhnEvery);
+      }
     }
 
     // --- 起止标记 ---
@@ -441,14 +671,24 @@
       ctx.fillText(text, p.x + dx, p.y + dy);
     };
 
-    // 多链时只标第一条起止，否则 10 个标签会互相压住
-    const labelCount = multi ? 1 : d.chains;
-    for (let ci = 0; ci < labelCount; ci++) {
+    // 多链时只标**当前查看的那条**的起止，否则 10 个标签会互相压住
+    const marked = multi ? [state.sel] : screen.map((_, i) => i);
+    for (const ci of marked) {
+      if (!screen[ci]) continue;
       const s = screen[ci];
       markStart({ x: s.px[0], y: s.py[0] }, startColor);
       label({ x: s.px[0], y: s.py[0] }, '起点', c.secondary, 9, -11);
       if (state.frac >= 1) {
         const p = proj(cam, d.R[ci][0], d.R[ci][1], d.R[ci][2]);
+        // 终点外面再套一圈很淡的光环：一眼能找到「这条链走到哪了」
+        ctx.save();
+        ctx.globalAlpha = 0.28;
+        ctx.strokeStyle = endColor;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
         markEnd(p, endColor);
         label(p, '终点', c.secondary, 9, -11);
       }
@@ -461,9 +701,11 @@
       ctx.textAlign = 'center';
       const mx = (p0.x + p1.x) / 2;
       const my = (p0.y + p1.y) / 2;
-      ctx.fillText(`R${multi ? '₁' : ''} = ${fmt(d.R_mag[0])}`, mx, my - 9);
+      ctx.fillText(`R${multi ? state.sel + 1 : ''} = ${fmt(d.R_mag[state.sel])}`, mx, my - 9);
     }
     ctx.textAlign = 'left';
+    if (opt('c-hud')) drawHud(ctx, d);
+    if (showAxis) drawGizmo(ctx, w, h);
   }
 
   /* ---------------- 对照面板 ---------------- */
@@ -487,13 +729,25 @@
 
     const row1 = document.createElement('div');
     row1.className = 'compare-row';
+    const i = Math.min(state.sel, d.chains - 1);
     row1.append(
-      compareItem('实测 R' + (d.chains > 1 ? '₁' : ''), fmt(d.R_mag[0])),
-      compareItem('理论 h_rms = l√n', fmt(d.h_rms)),
+      compareItem('实测 R' + (d.chains > 1 ? `（链 ${i + 1}）` : ''), fmt(d.R_mag[i])),
+      compareItem('理论 h_rms（本模型）', fmt(d.h_rms)),
       compareItem('最可几 h*', fmt(d.h_mp)),
-      compareItem('R / h_rms', fmt(d.R_mag[0] / d.h_rms)),
+      compareItem('R / h_rms', fmt(d.R_mag[i] / d.h_rms)),
     );
     box.appendChild(row1);
+    if (d.chains > 1) {
+      // 末端矢量也摆出来：选中某一条时，这三个分量最能说明它朝哪边伸
+      const row2 = document.createElement('div');
+      row2.className = 'compare-row';
+      row2.append(
+        compareItem('末端矢量 x', fmt(d.R[i][0])),
+        compareItem('y', fmt(d.R[i][1])),
+        compareItem('z', fmt(d.R[i][2])),
+      );
+      box.appendChild(row2);
+    }
 
     const note = document.createElement('p');
     note.className = 'compare-note';
@@ -538,11 +792,35 @@
   function renderLegend(d) {
     const box = $('chain-legend');
     box.textContent = '';
-    if (d.chains < 2) { box.hidden = true; return; }
+    const extra = [];
+    const kuhnEvery = Math.round((Number(d.kuhn_length) || 0) / (Number(d.l) || 1));
+    if (kuhnEvery >= 2) {
+      extra.push(['dot', `● 每过一个 Kuhn 长度 b = ${fmt(d.kuhn_length)}`]);
+    }
+    extra.push(['dash', '┄ h_rms 参考球（虚线，参考量）']);
+    if (d.chains < 2 && !extra.length) { box.hidden = true; return; }
     box.hidden = false;
     for (let i = 0; i < d.chains; i++) {
       const item = document.createElement('span');
-      item.className = 'legend-item';
+      item.className = 'legend-item' + (d.chains > 1 && i === state.sel ? ' on' : '');
+      if (d.chains > 1) {
+        // 点图例里的一条链 = 切到看它的数据。键盘也要能选，所以给 role/tabindex，
+        // 而不是只挂一个 click。悬停/选中的样式在 style.css 里。
+        item.setAttribute('role', 'button');
+        item.setAttribute('tabindex', '0');
+        item.setAttribute('aria-pressed', String(i === state.sel));
+        item.title = `查看链 ${i + 1} 的数据`;
+        const pick = () => {
+          state.sel = i;
+          renderCompare(state.data);
+          renderLegend(state.data);
+          draw();
+        };
+        item.addEventListener('click', pick);
+        item.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(); }
+        });
+      }
       const k = document.createElement('span');
       k.className = 'legend-key';
       k.style.background = `var(--series-${(i % 5) + 1})`;
@@ -551,9 +829,65 @@
       item.append(k, t);
       box.appendChild(item);
     }
+    extra.forEach(([kind, text]) => {
+      const item = document.createElement('span');
+      item.className = 'legend-item';
+      const k = document.createElement('span');
+      k.className = `legend-key ${kind === 'dash' ? 'dash' : 'dot'}`;
+      if (kind === 'dot') k.style.background = 'var(--accent-2)';
+      const t = document.createElement('span');
+      t.textContent = text;
+      item.append(k, t);
+      box.appendChild(item);
+    });
   }
 
   /* ---------------- 数据 ---------------- */
+
+  /* ---------------- 跟随上面的 n ---------------- */
+
+  // 与后端 CHAIN_N_MAX 对齐：超过这个数画出来就是一团结，3D 视图不收
+  const N_MAX_DRAW = 20000;
+
+  /** 把顶部参数行那套参数导进这张卡片：**链段数 n + 画几条链**。
+   *
+   *  规则（都是「宁可说清楚，也不要悄悄画一个别的」）：
+   *   · n 取顶部**第一个**值（顶部可以填多个做对比）；
+   *   · **画几条链取顶部 n 的个数**（夹到 1–5）—— 上面填「100, 300」时这里就画
+   *     两条 n = 100 的独立链，正好用来看 ⟨R²⟩ 怎么往理论值收。
+   *     注意每条链都用**第一个 n**：后端一次只采一个 n，真要看不同 n 的构象，
+   *     得把上面的 n 分别改一次各看一遍。
+   *   · 超过 3D 的绘制上限时不跟，保留当前值并在告警条里说明；
+   *   · 值没变就不动 —— 免得每敲一个字符都重取一次链。
+   *  返回 true 表示「已经派发过 input」，调用方不用再管。
+   */
+  function syncFromTop() {
+    const follow = $('c-follow');
+    if (!follow || !follow.checked) return false;
+    const vals = String($('in-n').value || '')
+      .split(/[,，;；\s]+/).filter((s) => s.length)
+      .map((s) => Math.floor(Number(s)))
+      .filter((v) => isFinite(v) && v >= 1);
+    if (!vals.length) return false;
+    const n = vals[0];
+    const box = $('c-n');
+    const boxChains = $('c-chains');
+    const chains = Math.min(5, Math.max(1, vals.length));
+    if (n > N_MAX_DRAW) {
+      setError(`上面的 n = ${n} 超过 3D 视图的绘制上限 ${N_MAX_DRAW}`
+        + `（再多画出来就是一团结），这里仍按 n = ${box.value} 画；`
+        + '想单独指定就取消勾选「跟随上面的参数」。');
+      return false;
+    }
+    if (String(n) === box.value.trim() && String(chains) === boxChains.value.trim()) {
+      return false;
+    }
+    box.value = String(n);
+    boxChains.value = String(chains);
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    boxChains.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
 
   async function fetchChain() {
     const cv = $('chain-canvas');
@@ -579,6 +913,9 @@
           l,
           chains: chainsRaw === '' ? 1 : Number(chainsRaw),
           seed: seedRaw === '' ? null : Number(seedRaw),
+          // 3D 构象也按当前链模型采样：自由旋转链固定键角、受累旋转链带内旋转、
+          // 蠕虫状链按弯曲刚度 —— 图上要能看出模型之间的差别。
+          ...(window.fjcApp ? window.fjcApp.modelParams() : {}),
         }),
       });
       data = await res.json().catch(() => ({ error: '服务器返回了无法解析的内容' }));
@@ -596,6 +933,9 @@
     if (seedRaw === '') $('c-seed').value = String(data.seed);
 
     state.data = data;
+    // 链数变了（或换了种子）以后，选中的下标可能越界 —— 夹一下，不重置，
+    // 免得每换一个种子就把用户选的链丢回第一条
+    state.sel = Math.min(state.sel, data.chains - 1);
     state.frac = 1;
     setError(null, data.warnings);
     renderCompare(data);
@@ -722,10 +1062,60 @@
     $('c-seed').addEventListener('input', schedule);
     // l 与上方分布图共用，改 l 时这张图也要跟着变
     $('in-l').addEventListener('input', schedule);
+    // 链模型和它的三个参数都会改变采样出来的构象：换模型要重取一次，
+    // 否则图上还是上一条链，看着像「切了模型但 3D 没动」。
+    ['in-model', 'in-theta', 'in-cosphi', 'in-p'].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener('change', schedule);
+      el.addEventListener('input', schedule);
+    });
 
     $('c-grid').addEventListener('change', () => {
       state.grid = $('c-grid').checked;
       draw();
+    });
+    // 跟随上面的参数：勾上时这两个输入框由顶部驱动（置灰，免得改了又被覆盖）
+    const follow = $('c-follow');
+    if (follow) {
+      const apply = () => {
+        $('c-n').disabled = follow.checked;
+        $('c-chains').disabled = follow.checked;
+        if (follow.checked) syncFromTop();
+      };
+      follow.addEventListener('change', apply);
+      apply();
+    }
+    $('in-n').addEventListener('input', syncFromTop);
+    // 四个显示开关只重画一遍：它们不改数据、也不重新取数
+    ['c-axis', 'c-sphere', 'c-kuhn', 'c-hud'].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener('change', draw);
+    });
+    // 点画布选链：找离点击处最近的**末端点**（40px 以内才算命中）。
+    // 拖拽过就不算点击 —— 否则转一下视角就会把选中的链换掉。
+    let downAt = null;
+    cv.addEventListener('pointerdown', (ev) => { downAt = { x: ev.clientX, y: ev.clientY }; });
+    cv.addEventListener('click', (ev) => {
+      const d = state.data;
+      if (!d || d.chains < 2 || !state.cam) return;
+      if (downAt && Math.hypot(ev.clientX - downAt.x, ev.clientY - downAt.y) > 4) return;
+      const rect = cv.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      let best = -1;
+      let bestD = 40;
+      for (let i = 0; i < d.chains; i++) {
+        const p = proj(state.cam, d.R[i][0], d.R[i][1], d.R[i][2]);
+        const dist = Math.hypot(p.x - mx, p.y - my);
+        if (dist < bestD) { bestD = dist; best = i; }
+      }
+      if (best >= 0 && best !== state.sel) {
+        state.sel = best;
+        renderCompare(d);
+        renderLegend(d);
+        draw();
+      }
     });
 
     $('c-new').addEventListener('click', () => {

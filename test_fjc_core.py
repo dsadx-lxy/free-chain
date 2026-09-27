@@ -1311,5 +1311,205 @@ class TestKuhnPresets(unittest.TestCase):
         self.assertIsInstance(rows[0], dict)
 
 
+class TestChainModels(unittest.TestCase):
+    """四个链模型：定义、极限、以及**采样器与模型理论是不是同一件事**。
+
+    这一组盯的是「模型只定义一处」：compute / random_chain / sweep 都从
+    model_h2 取数，采样器不许另算一套理论值 —— 所以下面每个模型都拿
+    「采样出来的 ⟨R²⟩」和「模型的 ⟨h²⟩」直接对拍。数字锚点全是教科书值。
+    """
+
+    THETA_PE = math.degrees(math.acos(-1.0 / 3.0))   # 聚乙烯 sp³ 键角 109.47°
+
+    def test_default_is_fjc_and_nothing_moved(self):
+        self.assertEqual(fjc.ModelParams().key, fjc.MODEL_FJC)
+        self.assertEqual(fjc.compute(100, 1.0).h2, 100.0)          # 老锚点
+        self.assertEqual(fjc.compute(100, 1.0).Cn, 1.0)
+        self.assertEqual(fjc.compute(100, 1.0).model, "fjc")
+        self.assertEqual(fjc.compute(100, 1.0).kuhn_length, 1.0)
+
+    def test_frc_anchors(self):
+        """自由旋转链：θ=90° 精确退回 FJC；聚乙烯键角的长链极限 Cn = 2。"""
+        self.assertAlmostEqual(fjc.freerotating_h2(100, 1.0, 90.0),
+                               fjc.compute(100, 1.0).h2, places=9)
+        mp = fjc.ModelParams.of("frc", theta_deg=self.THETA_PE)
+        self.assertAlmostEqual(fjc.model_cn_infinite(mp), 2.0, places=9)
+        # 有限 n 的精确离散值比渐近值小一点（差 O(1/n)），这正是页面对照图要对上的那个数
+        cn100 = fjc.model_cn(mp, 100, 1.0)
+        self.assertLess(cn100, 2.0)
+        self.assertAlmostEqual(cn100, 1.9850, places=3)
+
+    def test_hindered_anchors(self):
+        """⟨cosφ⟩=0 时受累旋转链就是自由旋转链；聚乙烯那组长链极限 Cn = 6。"""
+        frc = fjc.ModelParams.of("frc", theta_deg=self.THETA_PE)
+        hind0 = fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.0)
+        for n in (1, 10, 100, 500):
+            self.assertAlmostEqual(fjc.model_h2(hind0, n, 1.0),
+                                   fjc.model_h2(frc, n, 1.0), places=9)
+        pe = fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.5)
+        self.assertAlmostEqual(fjc.model_cn_infinite(pe), 6.0, places=6)
+
+    def test_hindered_closed_form_matches_the_transfer_matrix(self):
+        """闭式 vs 逐步递推的 2×2 转移矩阵（含 c+g=0 那个退化点）。"""
+        def recur(n, c, g):
+            if n == 1:
+                return 1.0
+            s = math.sqrt(max(0.0, 1.0 - c * c))
+            a, b = 1.0, 0.0
+            tot = 0.0
+            for k in range(1, n):
+                a, b = c * a + s * g * b, s * a - c * g * b
+                tot += (n - k) * a
+            return n + 2 * tot
+
+        # θ=120°、⟨cosφ⟩=−0.5 正好落在 c+g=0 上（c=0.5、g=−0.5），是最容易写错的一格
+        for theta, g in ((self.THETA_PE, 0.5), (90.0, 0.0), (120.0, -0.5),
+                         (60.0, 0.9), (150.0, 0.99)):
+            c = -math.cos(math.radians(theta))
+            mp = fjc.ModelParams.of("hindered", theta_deg=theta, cos_phi=g)
+            for n in (1, 2, 3, 7, 40, 200):
+                self.assertAlmostEqual(fjc.model_h2(mp, n, 1.0), recur(n, c, g),
+                                       places=9, msg=f"θ={theta} g={g} n={n}")
+
+    def test_wlc_limits(self):
+        """蠕虫状链的两端：L≫p 回到 ⟨h²⟩ ≈ 2pL；L≪p 退化成刚杆 ⟨h²⟩ ≈ L²。"""
+        p = 10.0
+        mp = fjc.ModelParams.of("wlc", p=p)
+        # 长链端：与 2pL 的相对差应当只剩 p/L 那一阶（不是随便一个「差不多」）
+        for n in (1000, 100000):
+            ratio = fjc.model_h2(mp, n, 1.0) / (2 * p * n)
+            self.assertLess(abs(ratio - 1.0), 2.0 * p / n)
+        # 短链端：L/p ≪ 1 时退化成刚杆 ⟨h²⟩ ≈ L²（差的是 (1/3)(L/p) 那一阶）。
+        # 用 p=300 把 L/p 压到 1/300；p=10 时 L/p=0.1，偏差有 3%，故意不在这里断言。
+        stiff = fjc.ModelParams.of("wlc", p=300.0)
+        ratio = fjc.model_h2(stiff, 1, 1.0)
+        self.assertLess(ratio, 1.0)
+        self.assertAlmostEqual(ratio, 1.0, places=2)
+        # 链越硬（p 越大）⟨h²⟩ 越大，且永远不超过刚杆的 L²
+        n, l = 200, 1.0
+        vals = [fjc.model_h2(fjc.ModelParams.of("wlc", p=pp), n, l) for pp in (1.0, 10.0, 100.0)]
+        self.assertEqual(vals, sorted(vals))
+        self.assertLess(vals[-1], (n * l) ** 2)
+
+    def test_sampler_steps_and_correlations(self):
+        """采样器：每步长度精确为 l；方向关联恰好是模型要求的那个数。"""
+        n, chains = 120, 400
+        cases = (
+            (fjc.ModelParams.of("frc", theta_deg=self.THETA_PE), -math.cos(math.radians(self.THETA_PE))),
+            (fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.5),
+             -math.cos(math.radians(self.THETA_PE))),
+            (fjc.ModelParams.of("wlc", p=10.0), math.exp(-0.1)),
+        )
+        for mp, want_c1 in cases:
+            r = fjc.random_chain(n, 1.0, seed=11, chains=chains, max_n=None,
+                                 max_chains=None, points_max=None, params=mp)
+            u = np.diff(r.points, axis=1)
+            norms = np.linalg.norm(u, axis=-1)
+            self.assertAlmostEqual(float(norms.mean()), 1.0, places=12, msg=mp.key)
+            c1 = float(np.mean(np.sum(u[:, :-1] * u[:, 1:], axis=-1)))
+            self.assertAlmostEqual(c1, want_c1, delta=0.02, msg=f"{mp.key} 的 ⟨u₀·u₁⟩")
+        # 受累旋转链的二阶关联还要看内旋转：⟨u₀·u₂⟩ = c² + s²⟨cosφ⟩
+        c = -math.cos(math.radians(self.THETA_PE))
+        r = fjc.random_chain(n, 1.0, seed=11, chains=chains, max_n=None,
+                             max_chains=None, points_max=None,
+                             params=fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                       cos_phi=0.5))
+        u = np.diff(r.points, axis=1)
+        c2 = float(np.mean(np.sum(u[:, :-2] * u[:, 2:], axis=-1)))
+        self.assertAlmostEqual(c2, c * c + (1 - c * c) * 0.5, delta=0.02)
+
+    def test_sampled_R2_matches_every_model(self):
+        """四个模型各采一批链，⟨R²⟩ 必须落在模型 ⟨h²⟩ 的 3σ 内（seed 写死）。"""
+        cases = (fjc.ModelParams.of("fjc"),
+                 fjc.ModelParams.of("frc", theta_deg=self.THETA_PE),
+                 fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.5),
+                 fjc.ModelParams.of("wlc", p=10.0))
+        for mp in cases:
+            for n in (20, 100):
+                r = fjc.random_chain(n, 1.0, seed=7, chains=4000, max_n=None,
+                                     max_chains=None, points_max=None, params=mp)
+                dev = (r.R2_mean - r.R2_theory) / r.R2_theory
+                self.assertLess(abs(dev), 3 * r.R2_rel_se,
+                                msg=f"{mp.key} n={n}：偏差 {dev:.4f} 超出 3σ={3 * r.R2_rel_se:.4f}")
+
+    def test_sampler_and_sweep_share_the_stream_for_every_model(self):
+        """同一条随机流上，_sweep_endpoints 与 random_chain 的末端矢量逐位相同。"""
+        for mp in (fjc.ModelParams.of("fjc"), fjc.ModelParams.of("frc"),
+                   fjc.ModelParams.of("hindered"), fjc.ModelParams.of("wlc", p=5.0)):
+            a = fjc.random_chain(30, 1.0, seed=5, chains=4, params=mp)
+            b = fjc._sweep_endpoints(np.random.default_rng(5), 30, 4, mp)
+            self.assertTrue(np.array_equal(a.R, b), msg=mp.key)
+            # 3D 视图要在链上标出「每过一个 Kuhn 长度」，所以这条也得跟着模型走
+            self.assertAlmostEqual(a.kuhn_length, fjc.model_kuhn_length(mp, 1.0), places=12,
+                                   msg=mp.key)
+
+    def test_sweep_reference_slope_is_model_aware(self):
+        """斜率参考值：前三个模型恒为 1，WLC 由它自己的曲线定（不是 1）。"""
+        plain = fjc.sweep([10, 100, 1000], 1.0, seed=1, chains=500,
+                          params=fjc.ModelParams.of("frc"))
+        self.assertEqual(plain.slope_ref, 1.0)
+        self.assertFalse(any("这不该发生" in w for w in plain.warnings))
+
+        wlc = fjc.sweep([10, 100, 1000], 1.0, seed=1, chains=500,
+                        params=fjc.ModelParams.of("wlc", p=10.0))
+        self.assertGreater(wlc.slope_ref, 1.05)      # 短链端是 L²，斜率明显大于 1
+        self.assertLess(wlc.slope_ref, 1.4)
+        self.assertFalse(any("这不该发生" in w for w in wlc.warnings))
+        self.assertEqual(wlc.model, "wlc")
+
+    def test_model_params_validation(self):
+        """非法参数要报中文错，而不是崩掉或悄悄算错。"""
+        for bad in (dict(model="nope"), dict(theta_deg=0.0), dict(theta_deg=180.0),
+                    dict(cos_phi=1.0), dict(cos_phi=-0.9), dict(p=0.0), dict(p=1e6)):
+            with self.assertRaises(fjc.FJCInputError):
+                fjc.ModelParams.of(**bad)
+        self.assertEqual(fjc.ModelParams.of("FRC  ").key, "frc")      # 大小写与空格都认
+        self.assertEqual(fjc.ModelParams.of("hindered", cos_phi="0.25").cos_phi, 0.25)
+
+    def test_model_catalog_is_json_safe(self):
+        import json
+        rows = fjc.model_catalog()
+        self.assertEqual([r["key"] for r in rows], list(fjc.MODEL_KEYS))
+        json.dumps(rows, ensure_ascii=False)
+        for r in rows:
+            self.assertTrue(r["label"] and r["formula"] and r["note"])
+            for spec in r["params"].values():
+                self.assertIn("default", spec)
+                self.assertIn("used", spec)
+        # 每个模型至少用一个参数：FJC 一个都不用，其余各用它自己那个
+        self.assertFalse(any(s["used"] for s in rows[0]["params"].values()))
+        self.assertTrue(rows[1]["params"]["theta_deg"]["used"])
+        self.assertTrue(rows[3]["params"]["p"]["used"])
+
+    def test_fingerprint_curves(self):
+        """模型指纹：关联的解析锚点、Cn 的收敛、四个模型的对比行。"""
+        c = -math.cos(math.radians(self.THETA_PE))
+        base = fjc.model_fingerprint(fjc.ModelParams.of("fjc"), points=8)
+        self.assertEqual(base["corr"][0], 1.0)
+        self.assertTrue(all(v == 0.0 for v in base["corr"][1:]), "FJC 隔一段就该不相关")
+        self.assertEqual([r["key"] for r in base["compare"]], list(fjc.MODEL_KEYS))
+        self.assertEqual(len(base["cn"]), len(base["ns"]))
+
+        frc = fjc.model_fingerprint(fjc.ModelParams.of("frc", theta_deg=self.THETA_PE), points=8)
+        for k in (1, 2, 5):
+            self.assertAlmostEqual(frc["corr"][k], c ** k, places=12)
+
+        wlc = fjc.model_fingerprint(fjc.ModelParams.of("wlc", p=10.0), points=8)
+        self.assertAlmostEqual(wlc["corr"][3], math.exp(-0.3), places=12)
+
+        # 受阻旋转链的关联是两根之和：⟨cosφ⟩=0 时必须与自由旋转链逐点相同
+        h0 = fjc.model_fingerprint(
+            fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.0), points=8)
+        for k in range(6):
+            self.assertAlmostEqual(h0["corr"][k], c ** k, places=9)
+
+        # Cn 随 n 单调趋向 C∞（有限 n 一律更小），且与 l 无关（只由模型参数定）
+        for key in fjc.MODEL_KEYS:
+            cn = fjc.model_fingerprint(fjc.ModelParams.of(key), points=10)["cn"]
+            self.assertLessEqual(max(cn), cn[-1] + 1e-9, f"{key} 的 Cn 应当在末尾最大")
+        mp = fjc.ModelParams.of("wlc", p=10.0)
+        self.assertAlmostEqual(fjc.model_cn(mp, 100, 3.0), fjc.model_cn(mp, 100, 1.0), places=12)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -240,7 +240,7 @@
     // 贴在一起会叠字。标注只给理论线下一个，拟合线的斜率交给图例和汇总行。
     el('text', {
       class: 'sweep-label', x: SCH.left + SPW + 12, y: sy(tB) + 4, 'text-anchor': 'start',
-    }, svg).textContent = '理论 n·l²';
+    }, svg).textContent = '理论 ⟨h²⟩（本模型）';
 
     // --- 悬停层 ---
     const hg = el('g', {}, svg);
@@ -311,7 +311,7 @@
     };
 
     row('模拟 ⟨R²⟩', fmt(p.y), seriesVar(0));
-    row('理论 n·l²', fmt(p.t), seriesVar(1));
+  row('理论 ⟨h²⟩（本模型）', fmt(p.t), seriesVar(1));
     row('相对偏差', `${p.dev >= 0 ? '+' : ''}${(p.dev * 100).toFixed(2)}%`);
     row('特征比 Cn', fmt(p.cn));
     row('h_rms 模拟', fmt(Math.sqrt(p.y)));
@@ -346,7 +346,7 @@
 
     [
       { k: 'dot', color: seriesVar(0), text: '模拟 ⟨R²⟩' },
-      { k: 'line', color: seriesVar(1), text: '理论 n·l²' },
+      { k: 'line', color: seriesVar(1), text: '理论 ⟨h²⟩（本模型）' },
       { k: 'dash', color: 'var(--text-secondary)', text: fitText },
       { k: 'band', color: seriesVar(1), text: '±2σ 涨落带', fade: true },
     ].forEach((it) => {
@@ -416,6 +416,24 @@
         warns.unshift(
           `链段长度 l 现在是 ${now}，这张图是 l = ${d.l} 时扫的 —— 点「运行模拟」重扫一遍。`
         );
+      }
+      // 链模型（或它的参数）换了，这张图同样是旧的：理论线、参考斜率全对不上
+      const cur = window.fjcApp ? window.fjcApp.modelParams() : null;
+      if (cur && d.model && cur.model !== d.model) {
+        warns.unshift(
+          `这张图是用${(d.params && d.params.label) || d.model}扫的，现在上面选的是另一个模型`
+          + ' —— 点「运行模拟」重扫一遍。'
+        );
+      } else if (cur && d.params) {
+        const moved = ['theta_deg', 'cos_phi', 'p'].filter((k) => (
+          cur[k] !== undefined && d.params[k] !== undefined
+          && Math.abs(cur[k] - d.params[k]) > 1e-12
+        ));
+        if (moved.length) {
+          warns.unshift(
+            `模型参数变了（${moved.join('、')}），这张图是按旧参数扫的 —— 点「运行模拟」重扫一遍。`
+          );
+        }
       }
     }
     renderAlerts('sweep-alerts', null, warns);
@@ -522,7 +540,12 @@
       const res = await fetch('/api/sweep', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ n: ns, l, seed, chains }),
+        // 扫描也按当前链模型：WLC 短链端是 L²、长链端才过渡到 L¹，
+        // 所以它的拟合斜率本来就不是 1（参考斜率由后端按模型自己的曲线算）。
+        body: JSON.stringify({
+          n: ns, l, seed, chains,
+          ...(window.fjcApp ? window.fjcApp.modelParams() : {}),
+        }),
       });
       const data = await res.json().catch(() => ({ error: '服务器返回了无法解析的内容' }));
       if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
@@ -573,6 +596,14 @@
 
     // l 改了：图没变，但要立刻把「该重扫了」说出来
     $('in-l').addEventListener('input', refreshAlerts);
+    // 换了链模型（或它的参数）以后，上一次的扫描结果就作废了 —— 理论线、参考斜率
+    // 和模拟点全都对不上，得提示重跑。refreshAlerts 干的就是这个。
+    ['in-model', 'in-theta', 'in-cosphi', 'in-p'].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener('change', refreshAlerts);
+      el.addEventListener('input', refreshAlerts);
+    });
 
     const svg = $('sweep-chart');
     svg.addEventListener('pointermove', (ev) => {

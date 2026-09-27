@@ -77,11 +77,135 @@ async function compute(ns, l) {
   const res = await fetch('/api/compute', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ n: ns.length === 1 ? ns[0] : ns, l }),
+    body: JSON.stringify({ n: ns.length === 1 ? ns[0] : ns, l, ...modelParams() }),
   });
   const data = await res.json().catch(() => ({ error: '服务器返回了无法解析的内容' }));
   if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
   return data.results;
+}
+
+/* ---------------- 链模型 ----------------
+ *
+ * 四个模型的目录（标签、公式、说明、参数范围）从 GET /api/models 拉 —— 唯一的那份
+ * 在 fjc_core.model_catalog()，JS 里不抄第二份，所以界面上这个下拉永远和服务端一致。
+ * 参数字段按模型显隐：自由旋转链要键角、受累旋转链再多一个 ⟨cosφ⟩、
+ * 蠕虫状链改用持久长度 p。
+ */
+
+let MODEL_BY_KEY = new Map();
+
+/** 当前模型 + 参数，直接读界面 —— 计算、3D、扫描三处取数共用这一个。 */
+function modelParams() {
+  const key = $('in-model').value || 'fjc';
+  const spec = MODEL_BY_KEY.get(key);
+  const out = { model: key };
+  if (!spec) return out;
+  const num = (id, fallback) => {
+    const v = Number($(id).value);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  if (spec.params.theta_deg.used) out.theta_deg = num('in-theta', spec.params.theta_deg.default);
+  if (spec.params.cos_phi.used) out.cos_phi = num('in-cosphi', spec.params.cos_phi.default);
+  if (spec.params.p.used) out.p = num('in-p', spec.params.p.default);
+  return out;
+}
+
+/** 在某段说明下面挂一行模型注释（没有就建一个）。
+ *  力–伸长与链长扫描那两张卡最容易误读 —— 前者的曲线**不随模型变**，
+ *  后者的「理论线」在非 FJC 模型下也不是 n·l²，所以各挂一行说清楚。 */
+function noteUnder(anchorId, noteId, text) {
+  let note = document.getElementById(noteId);
+  if (!note) {
+    const anchor = document.getElementById(anchorId);
+    if (!anchor) return;
+    note = document.createElement('p');
+    note.id = noteId;
+    note.className = 'chart-note';
+    anchor.after(note);
+  }
+  note.textContent = text;
+  note.hidden = !text;
+}
+
+/** 按模型显隐参数字段，并把公式与说明换成这个模型的。 */
+function syncModelFields() {
+  const spec = MODEL_BY_KEY.get($('in-model').value);
+  if (!spec) return;
+  $('theta-wrap').hidden = !spec.params.theta_deg.used;
+  $('cosphi-wrap').hidden = !spec.params.cos_phi.used;
+  $('p-wrap').hidden = !spec.params.p.used;
+  // 说明里带默认参数（「键角固定为 109.47°」这种），所以换成当前输入框里的值
+  const now = modelParams();
+  $('model-formula').textContent = spec.formula;
+  $('model-note').textContent = spec.note
+    .replace(String(spec.params.theta_deg.default), String(now.theta_deg ?? spec.params.theta_deg.default))
+    .replace(String(spec.params.cos_phi.default), String(now.cos_phi ?? spec.params.cos_phi.default))
+    .replace(String(spec.params.p.default), String(now.p ?? spec.params.p.default));
+
+  /* 下面四张卡片的抬头都带上模型名 —— 它们的内容**都跟着模型换**，
+     不写清楚的话，切完模型只能靠猜这几张图是哪条链算的（数值表还要复制出去）。 */
+  const tag = `　·　${spec.label}`;
+  $('chart-title').textContent = `末端距分布 P(h)${tag}`;
+  $('chain-title').textContent = `链构象${tag}`;
+  $('sweep-title').textContent = `链长扫描：链变长时末端距怎么变${tag}`;
+  const tableTitle = document.querySelector('#sec-table .card-subtitle');
+  if (tableTitle) tableTitle.textContent = `统计量一览${tag}`;
+
+  // 力–伸长是唯一**不跟着模型换**的那张：说清它只画 FJC，别让人以为切错了
+  const isFjc = spec.key === 'fjc';
+  $('force-title').textContent = isFjc
+    ? '力–伸长曲线'
+    : '力–伸长曲线（仅适用于自由连接链）';
+  noteUnder('force-desc', 'force-model-note', isFjc ? '' :
+    '注意：这条曲线是 FJC 的解，和上面选的模型无关 —— 另外三个模型没有同等地位的'
+    + '解析力–伸长关系（蠕虫状链的 Marko–Siggia 是插值式近似），所以这里没跟着换。'
+    + '要换成对应模型的曲线，得先有那条关系式。');
+  noteUnder('sweep-desc', 'sweep-model-note', isFjc ? '' :
+    `当前是${spec.label}：双对数下的理论线不再是斜率 1 的直线（短链端接近 L²，`
+    + '长链端才过渡到 L¹）。汇总行里的「参考斜率」是按本模型自己的 ⟨h²⟩(n) 曲线算的，'
+    + '拿 1 去比会天天误报。');
+}
+
+async function loadModels(preferred) {
+  const res = await fetch('/api/models');
+  const data = await res.json();
+  const models = data.models || [];
+  MODEL_BY_KEY = new Map(models.map((m) => [m.key, m]));
+  const sel = $('in-model');
+  sel.textContent = '';
+  models.forEach((m) => {
+    const o = document.createElement('option');
+    o.value = m.key;
+    o.textContent = m.label;
+    sel.appendChild(o);
+  });
+  sel.value = MODEL_BY_KEY.has(preferred) ? preferred : 'fjc';
+  syncModelFields();
+  // 别的模块（3D、扫描、模型指纹）也要知道「目录到齐了、当前是哪个模型」
+  document.dispatchEvent(new CustomEvent('fjc:models-ready'));
+}
+
+/** 模型的读数条：本 n 下的特征比、等价 Kuhn 长度、等效 Kuhn 段数。
+ *  高斯近似能不能用就看最后那个 L/b —— 它比 10 小得多时 warnings 里会说明。 */
+function renderModelReadout(r) {
+  const box = $('model-readout');
+  if (!r || !r.params) { box.hidden = true; return; }
+  box.textContent = '';
+  const item = (k, v) => {
+    const s = document.createElement('span');
+    s.className = 'legend-item';
+    const a = document.createElement('span');
+    a.textContent = k;
+    const b = document.createElement('span');
+    b.className = 'tt-val';
+    b.textContent = v;
+    s.append(a, b);
+    box.appendChild(s);
+  };
+  item('Cn（本 n 下）', fmt(r.Cn));
+  item('等价 Kuhn 长度 b', `${fmt(r.kuhn_length)} l`);
+  item('等效 Kuhn 段数 L/b', fmt(r.n_kuhn));
+  box.hidden = false;
 }
 
 /* ---------------- n 的预设快捷值 ---------------- */
@@ -183,11 +307,14 @@ const TILES = [
 function renderHero(r, multi) {
   $('hero-label').textContent = multi
     ? `根均方末端距 h —— 取第一个 n = ${r.n}`
-    : '根均方末端距 h';
+    : `根均方末端距 h　·　${(MODEL_BY_KEY.get(r.model) || {}).label || ''}`;
   $('hero-value').textContent = fmt(r.h_rms);
-  $('hero-formula').textContent =
-    `h = l·√n = ${fmt(r.l)} × √${r.n} = ${fmt(r.h_rms)}` +
-    (multi ? '　（对比模式下主结果取第一个 n，其余见下表）' : '');
+  const tail = multi ? '　（对比模式下主结果取第一个 n，其余见下表）' : '';
+  // FJC 保留那条最认得出的式子；其余模型把「等效 Kuhn 长度」摆出来 ——
+  // 四个模型真正的差别就在这个数（以及 WLC 短链端那条过渡）
+  $('hero-formula').textContent = r.model === 'fjc'
+    ? `h = l·√n = ${fmt(r.l)} × √${r.n} = ${fmt(r.h_rms)}` + tail
+    : `h = √⟨h²⟩ = ${fmt(r.h_rms)}　|　Cn = ${fmt(r.Cn)}，b = ${fmt(r.kuhn_length)} l` + tail;
 }
 
 function renderTiles(r, multi) {
@@ -288,8 +415,12 @@ function drawChart(results, normalize) {
   });
 
   // --- 坐标轴 ---
+  // 横轴 + 竖轴都画：只有底下那条线时，读数只能靠网格推，眼睛没有落点
   el('line', {
     class: 'axis-line', x1: CH.left, x2: CH.left + PW, y1: CH.top + PH, y2: CH.top + PH,
+  }, svg);
+  el('line', {
+    class: 'axis-line', x1: CH.left, x2: CH.left, y1: CH.top, y2: CH.top + PH,
   }, svg);
 
   el('text', {
@@ -558,6 +689,18 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** 导出 PNG 要垫的底色：**必须是不透明的**。
+ *  面板是玻璃质感（半透明 + 背景模糊），照它自己的 background-color 垫底
+ *  会得到一张半透明的图 —— 贴进 PPT 就透出下面的花纹，正是当初要垫底色的理由。
+ *  所以读的是每个主题下专门给的 --png-bg；没有再退回面板自己的颜色。 */
+function opaqueBg(el) {
+  const root = document.querySelector('.viz-root');
+  const v = root && getComputedStyle(root).getPropertyValue('--png-bg').trim();
+  if (v) return v;
+  const cs = el ? getComputedStyle(el).backgroundColor : '';
+  return cs && cs !== 'rgba(0, 0, 0, 0)' ? cs : '#ffffff';
+}
+
 async function svgToPng(svg, name, scale = 2) {
   const vb = svg.viewBox && svg.viewBox.baseVal;
   const w = (vb && vb.width) || svg.clientWidth || 860;
@@ -585,7 +728,7 @@ async function svgToPng(svg, name, scale = 2) {
 
   // 2) 垫一张底色，否则导出的 PNG 是透明的 —— 贴进 PPT 会露出下面的花纹
   const holder = svg.closest('.card') || svg.parentElement;
-  const bgcs = holder ? getComputedStyle(holder).backgroundColor : '';
+  const bgcs = opaqueBg(holder);
   const bg = document.createElementNS(NS, 'rect');
   bg.setAttribute('x', 0); bg.setAttribute('y', 0);
   bg.setAttribute('width', w); bg.setAttribute('height', h);
@@ -741,12 +884,433 @@ function initScrollSpy() {
   }));
 }
 
+/* ---------------- 模块尺寸与位置（拖右下角改大小、抓标题栏换位置） ----------------
+ *
+ * 尺寸用原生 CSS 的 resize（取舍写在 style.css 那一段里），位置用指针事件自己拖。
+ * 这里补三件浏览器不管的事：
+ *
+ *  1. **拖动之后放开宽度上限**。卡片本来是「跟着内容定宽」的（图多宽卡片就多宽，
+ *     免得模块里出现大片空白）。那个上限会挡住用户拖宽，所以第一次真正拖动之后就撤掉它。
+ *  2. **记住**。浏览器不会为一次拖拽发事件，所以用 ResizeObserver 看尺寸变化、防抖后
+ *     写进 localStorage；下次打开按同样的大小摆回去。
+ *  3. **换位置**。抓 `.card-head`（主结果那条没有标题栏，用它的标签行）拖动，落点是
+ *     **同一个父容器里的兄弟卡片** —— 「只在所属分区内挪」是靠这条约束保证的：`.pair` /
+ *     `.layout` 这类成组容器各自算一格，卡片拖不出自己的组，并排的两张也就不会被拆散。
+ *     顺序同样记进 localStorage。
+ *
+ * 键：init 时给每张卡挂一个 `data-card-key`（有 id 用 id，没有的用 anon#N 按文档顺序编号）。
+ * 之所以不临时算序号：用户拖动之后卡片的序号会变，键必须**在第一次拖动之前就钉死**。
+ */
+const CARD_SIZE_KEY = 'fjc-card-sizes';
+
+function cardEls() {
+  return Array.from(document.querySelectorAll('.card, .hero'));
+}
+
+/* 键：init 时钉死（有 id 用 id，其余按文档顺序编 anon#N）。
+   不能临时算序号 —— 用户拖过之后卡片序号就变了，键必须在第一次拖动之前固定。 */
+function initCardKeys() {
+  let anon = 0;
+  cardEls().forEach((el) => { el.dataset.cardKey = el.id || `anon#${anon++}`; });
+}
+
+/** 同一个父容器里的卡片兄弟 —— 换位只发生在这些兄弟之间。 */
+function cardSiblings(el) {
+  const parent = el.parentElement;
+  if (!parent) return [el];
+  return Array.from(parent.children)
+    .filter((c) => c.classList.contains('card') || c.classList.contains('hero'));
+}
+
+function applyCardSizes() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(CARD_SIZE_KEY) || '{}') || {}; } catch { saved = {}; }
+  cardEls().forEach((el) => {
+    const s = saved[el.dataset.cardKey];
+    if (!s) return;
+    if (s.w) { el.style.width = `${s.w}px`; el.style.maxWidth = 'none'; }
+    if (s.h) el.style.height = `${s.h}px`;
+  });
+}
+
+/** 抓标题栏拖动换位：拖动 = 把卡片在当前分区里挪个位置。
+ *  • 只挪卡片自己，布局不动 —— 下面的卡片**不会**自动补位挤上来（见下面的「自由摆放」）。
+ *  • 双击卡片标题，或者页脚的「恢复默认布局」，让卡片回到自己那一格。 */
+function initCardDrag() {
+  cardEls().forEach((card) => {
+    const handle = card.querySelector(':scope > .card-head')
+      || card.querySelector(':scope > .hero-label');
+    if (!handle) return;
+    handle.title = '拖动可挪位置（只在当前分区内），双击回到原位';
+    let drag = null;
+
+    const onMove = (ev) => {
+      if (!drag) return;
+      ev.preventDefault();
+      freeCard(drag.card);
+      // 活动范围每次现算：拖动当中窗口、字号变了也不会跑出界
+      const b = dragBounds(drag.card);
+      const rawX = ev.clientX - drag.grabX - b.flowLeft;
+      const rawY = ev.clientY - drag.grabY - b.flowTop;
+      drag.card.style.left = `${Math.round(Math.min(b.maxX, Math.max(b.minX, rawX)))}px`;
+      drag.card.style.top = `${Math.round(Math.min(b.maxY, Math.max(b.minY, rawY)))}px`;
+      drag.moved = true;
+      slotGhost(drag.card);            // 原地留个虚框：这一格还是它的
+    };
+
+    const onUp = () => {
+      if (!drag) return;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      const card0 = drag.card;
+      const { moved } = drag;
+      drag = null;
+      card0.classList.remove('dragging');
+      // 只是点了一下（没挪）就别留下 relative + 抬起的痕迹
+      if (!moved) homeCard(card0, { tidy: false });
+      syncGhosts();
+      if (moved) saveCardPos();
+    };
+
+    handle.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return;
+      // 标题栏里的按钮、下拉、链接各自有用，别把它们也拖走
+      if (ev.target.closest('button, a, input, select, [role="button"]')) return;
+      const r = card.getBoundingClientRect();
+      drag = {
+        card,
+        moved: false,
+        grabX: ev.clientX - r.left,   // 手指/指针相对卡片左上角的偏移：抓住哪儿就从哪儿拖
+        grabY: ev.clientY - r.top,
+      };
+      card.classList.add('dragging');
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+
+    // 双击标题 = 收回原位（拖歪了不用拿尺子找像素）
+    handle.addEventListener('dblclick', (ev) => {
+      if (ev.target.closest('button, a, input, select, [role="button"]')) return;
+      if (!card.style.left && !card.style.top) return;
+      homeCard(card);
+      saveCardPos();
+    });
+  });
+}
+
+/* ---------- 在分区内自由摆放 ----------
+ * 位置 = position: relative + left/top 的**相对偏移**。
+ *  ① relative 的元素仍然占着自己原来那一格 —— 卡片被拖走的时候，下面的卡片
+ *    不会自动补位挤上来。（上一版用 position: absolute，卡片一脱离文档流，
+ *    下面的内容立刻上移，看着就像在「跳」，用户反馈的奇怪就是这么来的。）
+ *  ② 拖走的卡片原地留一个虚线空框（.card-ghost）：这一格还是它的。
+ *    双击卡片标题、点「恢复默认布局」都能把它收回去。
+ *  ③ 只存 { x, y } 两个相对偏移，都是 0 就不存 —— 默认布局下 localStorage 里是空的。
+ */
+const CARD_POS_KEY = 'fjc-card-pos2';   // 键换代：上一版存的是绝对坐标，语义不同
+
+function sectionOf(card) {
+  return card.closest('.page-section') || document.body;
+}
+
+function cardOffset(card) {
+  return { x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0 };
+}
+
+/** 让卡片进入「自由摆放」状态：照旧占着文档流里那一格，只是自己挪开一点。 */
+function freeCard(card) {
+  card.style.position = 'relative';
+  card.style.zIndex = '3';
+  return sectionOf(card);
+}
+
+/** 活动范围：以卡片**没有偏移时的那一格**为原点，四周不能超出分区的内容框。
+ *  卡片自己把分区撑到该有的高度，所以这个范围在拖动过程里是稳定的。
+ *  （顺带把边框算进去，1px 的偏差在贴边的时候看得出来。） */
+function dragBounds(card) {
+  const sec = sectionOf(card);
+  const sr = sec.getBoundingClientRect();
+  const cs = getComputedStyle(sec);
+  const bl = parseFloat(cs.borderLeftWidth) || 0;
+  const bt = parseFloat(cs.borderTopWidth) || 0;
+  const br = parseFloat(cs.borderRightWidth) || 0;
+  const bb = parseFloat(cs.borderBottomWidth) || 0;
+  const padL = parseFloat(cs.paddingLeft) || 0;
+  const padT = parseFloat(cs.paddingTop) || 0;
+  const padR = parseFloat(cs.paddingRight) || 0;
+  const padB = parseFloat(cs.paddingBottom) || 0;
+  const cr = card.getBoundingClientRect();
+  const { x, y } = cardOffset(card);
+  const flowLeft = cr.left - x;      // 流式位置（视口坐标；拖动期间不会变）
+  const flowTop = cr.top - y;
+  const minX = sr.left + bl + padL - flowLeft;
+  const maxX = sr.right - br - padR - cr.width - flowLeft;
+  const minY = sr.top + bt + padT - flowTop;
+  const maxY = sr.bottom - bb - padB - cr.height - flowTop;
+  return {
+    flowLeft, flowTop,
+    minX, maxX: Math.max(minX, maxX), minY, maxY: Math.max(minY, maxY),
+  };
+}
+
+/** 分区里的占位虚框：一张卡片一个，用 data-key 认领。
+ *  它**绝对定位、不参与排版**（所以不会把别的卡片挤走），插在分区最前面
+ *  ——免得抢走 `.page-section > :last-child` 那条「最后一块不留外边距」的样式。 */
+function ghostOf(sec, key) {
+  if (!sec || !sec.children) return null;
+  return Array.from(sec.children).find(
+    (c) => c.classList && c.classList.contains('card-ghost') && c.dataset.key === key,
+  ) || null;
+}
+
+function slotGhost(card) {
+  const sec = sectionOf(card);
+  if (!sec.classList || !sec.classList.contains('page-section')) return null;
+  let g = ghostOf(sec, card.dataset.cardKey);
+  if (!g) {
+    g = document.createElement('div');
+    g.className = 'card-ghost';
+    g.dataset.key = card.dataset.cardKey;
+    g.setAttribute('aria-hidden', 'true');
+    sec.insertBefore(g, sec.firstChild);
+  }
+  const sr = sec.getBoundingClientRect();
+  const cs = getComputedStyle(sec);
+  const cr = card.getBoundingClientRect();
+  const b = dragBounds(card);
+  g.style.left = `${Math.round(b.flowLeft - sr.left - (parseFloat(cs.borderLeftWidth) || 0))}px`;
+  g.style.top = `${Math.round(b.flowTop - sr.top - (parseFloat(cs.borderTopWidth) || 0))}px`;
+  g.style.width = `${Math.round(cr.width)}px`;
+  g.style.height = `${Math.round(cr.height)}px`;
+  return g;
+}
+
+/** 占位虚框和实际位置对齐一遍：松手、窗口变化、字体就位之后各叫一次。 */
+function syncGhosts() {
+  cardEls().forEach((card) => {
+    const sec = sectionOf(card);
+    if (!sec.classList || !sec.classList.contains('page-section')) return;
+    const g = ghostOf(sec, card.dataset.cardKey);
+    const { x, y } = cardOffset(card);
+    if (!x && !y) { if (g) g.remove(); return; }
+    slotGhost(card);
+  });
+}
+
+/** 把卡片收回自己那一格：抹掉偏移、虚框、抬起状态。 */
+function homeCard(card, opts = {}) {
+  card.style.left = '';
+  card.style.top = '';
+  card.style.zIndex = '';
+  card.style.position = '';
+  const g = ghostOf(sectionOf(card), card.dataset.cardKey);
+  if (g) g.remove();
+  if (opts.tidy !== false) syncGhosts();
+}
+
+/** 窗口变窄变高之后，把已经挪出去的卡片拉回分区里（否则会挂在分区外头）。 */
+function reclampCards() {
+  cardEls().forEach((card) => {
+    const { x, y } = cardOffset(card);
+    if (!x && !y) return;
+    const b = dragBounds(card);
+    const nx = Math.round(Math.min(b.maxX, Math.max(b.minX, x)));
+    const ny = Math.round(Math.min(b.maxY, Math.max(b.minY, y)));
+    if (nx !== x) card.style.left = `${nx}px`;
+    if (ny !== y) card.style.top = `${ny}px`;
+  });
+}
+
+let tidyTimer = 0;
+/** 窗口尺寸变了：先拉回边界，再重画虚框（防抖，省得 resize 期间疯狂算）。 */
+function tidyLayout() {
+  clearTimeout(tidyTimer);
+  tidyTimer = setTimeout(() => { reclampCards(); syncGhosts(); }, 180);
+}
+
+/** 只记挪过的卡片：{ 分区: { 卡片: {x, y} } }。 */
+function saveCardPos() {
+  const out = {};
+  cardEls().forEach((c) => {
+    const { x, y } = cardOffset(c);
+    if (!x && !y) return;
+    const sec = sectionOf(c);
+    const sk = sec.id || 'body';
+    out[sk] = out[sk] || {};
+    out[sk][c.dataset.cardKey] = { x: Math.round(x), y: Math.round(y) };
+  });
+  try { localStorage.setItem(CARD_POS_KEY, JSON.stringify(out)); } catch { /* 隐私模式，忽略 */ }
+}
+
+function applyCardPos() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(CARD_POS_KEY) || '{}') || {}; } catch { saved = {}; }
+  cardEls().forEach((c) => {
+    const sec = sectionOf(c);
+    const rec = (saved[sec.id || 'body'] || {})[c.dataset.cardKey];
+    if (!rec) return;
+    freeCard(c);
+    c.style.left = `${Math.round(rec.x) || 0}px`;
+    c.style.top = `${Math.round(rec.y) || 0}px`;
+  });
+}
+
+/* ---------- 八向改大小 ----------
+ * 原生 `resize` 只给右下角，而且改不了「往左/往上」。这里八个手柄自己算：
+ * 指针位移换算成 width/height 加 margin —— 卡片在布局里是居中的（margin: auto），
+ * 所以往左拉时同时把 margin-left 加上同样的位移，左边框才跟着指针走。
+ */
+const CARD_MIN_W = 260;
+const CARD_MIN_H = 140;
+
+function initCardHandles() {
+  const DIRS = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'];
+  cardEls().forEach((card) => {
+    DIRS.forEach((dir) => {
+      const g = document.createElement('div');
+      g.className = `card-grip card-grip-${dir}`;
+      g.dataset.dir = dir;
+      g.title = '拖动调整大小';
+      card.appendChild(g);
+    });
+  });
+}
+
+/** 这张卡此刻最多能拉到多宽：成组容器里的卡片不能超出自己那一格。 */
+function cardMaxWidth(card) {
+  const parent = card.parentElement;
+  if (getComputedStyle(parent).display.includes('grid')) {
+    // 同一格里的兄弟还有「没有手动宽度」的就借它的宽度当格宽；
+    // 都被拖过就退回整组的宽度（宁可给宽一点，也不要把用户卡死在半格）
+    const sib = cardSiblings(card).find((c) => c !== card && !c.style.width);
+    return Math.round((sib || parent).getBoundingClientRect().width);
+  }
+  return Math.round(parent.clientWidth);
+}
+
+function initCardResizeDrag() {
+  document.addEventListener('pointerdown', (ev) => {
+    const grip = ev.target.closest && ev.target.closest('.card-grip');
+    if (!grip || ev.button !== 0) return;
+    const card = grip.closest('.card, .hero');
+    if (!card) return;
+    ev.preventDefault();
+
+    const dir = grip.dataset.dir;
+    const r = card.getBoundingClientRect();
+    const cs = getComputedStyle(card);
+    const start = {
+      x: ev.clientX, y: ev.clientY, w: r.width, h: r.height,
+      ml: parseFloat(cs.marginLeft) || 0, mt: parseFloat(cs.marginTop) || 0,
+    };
+    const maxW = Math.max(CARD_MIN_W, cardMaxWidth(card));
+    card.classList.add('resizing');
+
+    const move = (e) => {
+      const dx = e.clientX - start.x;
+      const dy = e.clientY - start.y;
+      let w = start.w;
+      let h = start.h;
+      let ml = start.ml;
+      let mt = start.mt;
+      if (dir.includes('e')) w = Math.min(maxW, start.w + dx);
+      if (dir.includes('w')) { w = Math.min(maxW, start.w - dx); ml = start.ml + (start.w - w); }
+      if (dir.includes('s')) h = Math.max(CARD_MIN_H, start.h + dy);
+      if (dir.includes('n')) { h = Math.max(CARD_MIN_H, start.h - dy); mt = start.mt + (start.h - h); }
+      card.style.width = `${Math.round(w)}px`;
+      card.style.height = `${Math.round(h)}px`;
+      card.style.maxWidth = 'none';
+      card.style.marginLeft = `${Math.round(ml)}px`;
+      card.style.marginTop = `${Math.round(mt)}px`;
+      // 3D 画布是 canvas，让它彻底跟随盒子（去掉「4:3 + 620px」那套限制），
+      // 于是这一格的比例就是拖出来的比例；SVG 图仍然按自己的比例等比铺满。
+      const cv = card.querySelector('.chain-body > canvas');
+      if (cv) {
+        cv.style.maxWidth = 'none';
+        cv.style.aspectRatio = 'auto';
+        cv.style.height = '100%';
+        cv.style.width = '100%';
+      }
+    };
+    const up = () => {
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      card.classList.remove('resizing');
+      // 存盘交给已有的 ResizeObserver —— 它看见行内 width/height 就会记下来
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+  });
+}
+
+function initCardResize() {
+  initCardKeys();
+  applyCardSizes();
+  applyCardPos();
+  initCardDrag();
+  initCardHandles();
+  initCardResizeDrag();
+  // 布局稳定下来（字体、图都就位）再对齐一次虚框和活动边界；窗口变化时同理
+  requestAnimationFrame(() => { reclampCards(); syncGhosts(); });
+  window.addEventListener('resize', tidyLayout);
+  window.addEventListener('load', () => { reclampCards(); syncGhosts(); });
+  // 图、3D 画布要等一两秒才把高度撑到位，光靠 rAF 那一次会算早 ——
+  // 再补几拍（很便宜，只是把虚框挪回该在的地方）
+  [400, 1000, 2000].forEach((ms) => setTimeout(() => { reclampCards(); syncGhosts(); }, ms));
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => { reclampCards(); syncGhosts(); });
+  }
+  // 「恢复默认布局」：清掉尺寸和位置，回到出厂排布
+  const reset = $('reset-layout');
+  if (reset) {
+    reset.addEventListener('click', () => {
+      try {
+        localStorage.removeItem(CARD_SIZE_KEY);
+        localStorage.removeItem(CARD_POS_KEY);
+      } catch { /* 隐私模式，忽略 */ }
+      location.reload();
+    });
+  }
+  if (!window.ResizeObserver) return;      // 老浏览器：能拖，只是不记住
+  const pending = new Map();
+  const save = () => {
+    const out = {};
+    cardEls().forEach((el) => {
+      // 只记**用户拖过**的：没拖过的保持「跟着内容定宽」，别把自动宽度存成死值
+      if (!el.style.width && !el.style.height) return;
+      out[el.dataset.cardKey] = {
+        w: el.style.width ? Math.round(el.getBoundingClientRect().width) : null,
+        h: el.style.height ? Math.round(el.getBoundingClientRect().height) : null,
+      };
+    });
+    try { localStorage.setItem(CARD_SIZE_KEY, JSON.stringify(out)); } catch { /* 隐私模式，忽略 */ }
+  };
+  const ro = new ResizeObserver((entries) => {
+    entries.forEach((e) => {
+      const el = e.target;
+      // 拖动时浏览器会写行内 width/height —— 有它才说明是用户拉的，不是我们排的
+      if (el.style.width || el.style.height) el.style.maxWidth = 'none';
+      clearTimeout(pending.get(el));
+      pending.set(el, setTimeout(save, 400));
+    });
+  });
+  cardEls().forEach((el) => ro.observe(el));
+  // 分区是「随内容长」的：它一变形，虚框和活动边界就重新算一遍
+  const roSec = new ResizeObserver(() => tidyLayout());
+  document.querySelectorAll('.page-section').forEach((s) => roSec.observe(s));
+}
+
 /* ---------------- URL 状态 + 上次参数 ----------------
  *
  * 优先级：URL > localStorage > 默认值。
  * URL 在前是因为「把链接发给别人」必须以链接为准 —— 否则对方打开看到的
  * 是他自己浏览器里存的旧参数，分享就白分享了。 */
-const PARAM_DEFAULTS = { n: '100', l: '1', norm: false };
+// 链模型那几项的默认值要和 fjc_core.ModelParams 保持一致。对不上也不会算错 ——
+// 每个值都会送到服务端再校验一遍（校验只有一处），顶多是链接里多带一个参数。
+const PARAM_DEFAULTS = {
+  n: '100', l: '1', norm: false,
+  model: 'fjc', theta: '109.47', cosphi: '0.5', p: '10',
+};
 const PARAM_LS_KEY = 'fjc-params';
 
 function applyStoredParams() {
@@ -756,6 +1320,13 @@ function applyStoredParams() {
   const pick = {
     n: q.has('n') ? q.get('n') : (saved.n !== undefined ? saved.n : PARAM_DEFAULTS.n),
     l: q.has('l') ? q.get('l') : (saved.l !== undefined ? saved.l : PARAM_DEFAULTS.l),
+    model: q.has('model') ? q.get('model')
+      : (saved.model !== undefined ? saved.model : PARAM_DEFAULTS.model),
+    theta: q.has('theta') ? q.get('theta')
+      : (saved.theta !== undefined ? saved.theta : PARAM_DEFAULTS.theta),
+    cosphi: q.has('cosphi') ? q.get('cosphi')
+      : (saved.cosphi !== undefined ? saved.cosphi : PARAM_DEFAULTS.cosphi),
+    p: q.has('p') ? q.get('p') : (saved.p !== undefined ? saved.p : PARAM_DEFAULTS.p),
     norm: q.has('norm')
       ? (q.get('norm') === '1' || q.get('norm') === 'true')
       : (saved.norm !== undefined ? !!saved.norm : PARAM_DEFAULTS.norm),
@@ -763,6 +1334,12 @@ function applyStoredParams() {
   $('in-n').value = String(pick.n);
   $('in-l').value = String(pick.l);
   $('in-normalize').checked = !!pick.norm;
+  // 模型下拉这时还是「一个占位选项」，真正的选项要等 /api/models 回来；
+  // 所以这里先填参数输入框，模型键由 loadModels(…return这个pick…) 落地。
+  $('in-theta').value = String(pick.theta);
+  $('in-cosphi').value = String(pick.cosphi);
+  $('in-p').value = String(pick.p);
+  return pick;
 }
 
 function persistParams() {
@@ -770,6 +1347,10 @@ function persistParams() {
     n: $('in-n').value,
     l: $('in-l').value,
     norm: $('in-normalize').checked,
+    model: $('in-model').value,
+    theta: $('in-theta').value,
+    cosphi: $('in-cosphi').value,
+    p: $('in-p').value,
   };
   try { localStorage.setItem(PARAM_LS_KEY, JSON.stringify(st)); } catch { /* 隐私模式会抛，忽略 */ }
 
@@ -777,6 +1358,10 @@ function persistParams() {
   const q = new URLSearchParams();
   if (st.n !== PARAM_DEFAULTS.n) q.set('n', st.n);
   if (st.l !== PARAM_DEFAULTS.l) q.set('l', st.l);
+  if (st.model !== PARAM_DEFAULTS.model) q.set('model', st.model);
+  if (st.theta !== PARAM_DEFAULTS.theta) q.set('theta', st.theta);
+  if (st.cosphi !== PARAM_DEFAULTS.cosphi) q.set('cosphi', st.cosphi);
+  if (st.p !== PARAM_DEFAULTS.p) q.set('p', st.p);
   if (st.norm) q.set('norm', '1');
   const qs = q.toString();
   try {
@@ -788,6 +1373,11 @@ function resetParams() {
   $('in-n').value = PARAM_DEFAULTS.n;
   $('in-l').value = PARAM_DEFAULTS.l;
   $('in-normalize').checked = PARAM_DEFAULTS.norm;
+  $('in-model').value = PARAM_DEFAULTS.model;
+  $('in-theta').value = PARAM_DEFAULTS.theta;
+  $('in-cosphi').value = PARAM_DEFAULTS.cosphi;
+  $('in-p').value = PARAM_DEFAULTS.p;
+  syncModelFields();
   // Kuhn 预置和反解的读数都是跟着 l/n 走的，归位时一并清掉
   document.querySelectorAll('#kuhn-chips .chip').forEach((c) => {
     c.classList.remove('on');
@@ -796,7 +1386,8 @@ function resetParams() {
   $('kuhn-readout').hidden = true;
   $('solve-readout').hidden = true;
   $('sol-use').disabled = true;
-  ['in-n', 'in-l'].forEach((id) => $(id).dispatchEvent(new Event('input', { bubbles: true })));
+  ['in-n', 'in-l', 'in-theta', 'in-cosphi', 'in-p']
+    .forEach((id) => $(id).dispatchEvent(new Event('input', { bubbles: true })));
   clearTimeout(debounceTimer);
   refresh();
 }
@@ -1038,6 +1629,9 @@ function drawForceChart() {
   el('line', {
     class: 'axis-line', x1: FCH.left, x2: FCH.left + FPW, y1: FCH.top + FPH, y2: FCH.top + FPH,
   }, svg);
+  el('line', {
+    class: 'axis-line', x1: FCH.left, x2: FCH.left, y1: FCH.top, y2: FCH.top + FPH,
+  }, svg);
   el('text', {
     class: 'axis-title', x: FCH.left + FPW / 2, y: FCH.h - 14, 'text-anchor': 'middle',
   }, svg).textContent = '无量纲力 x = f·l / (k_B T)';
@@ -1232,6 +1826,7 @@ async function refresh() {
   const multi = results.length > 1;
   renderHero(results[0], multi);
   renderTiles(results[0], multi);
+  renderModelReadout(results[0]);
   renderLegend(results);
   renderTable(results);
   drawChart(results, state.normalize);
@@ -1259,6 +1854,25 @@ function initEvents() {
   $('in-n').addEventListener('input', scheduleRefresh);
   $('in-l').addEventListener('input', scheduleRefresh);
   $('in-normalize').addEventListener('change', refresh);
+  // 链模型：换模型要连字段显隐、公式说明一起换；改参数只重算
+  $('in-model').addEventListener('change', () => {
+    syncModelFields();
+    persistParams();
+    refresh();
+  });
+  ['in-theta', 'in-cosphi', 'in-p'].forEach((id) => {
+    $(id).addEventListener('input', () => { syncModelFields(); scheduleRefresh(); });
+  });
+  $('model-default').addEventListener('click', () => {
+    const spec = MODEL_BY_KEY.get($('in-model').value);
+    if (!spec) return;
+    $('in-theta').value = String(spec.params.theta_deg.default);
+    $('in-cosphi').value = String(spec.params.cos_phi.default);
+    $('in-p').value = String(spec.params.p.default);
+    syncModelFields();
+    persistParams();
+    refresh();
+  });
 
   // --- 新增的三件：Kuhn 预置、h → n 反解、力–伸长 ---
 
@@ -1398,7 +2012,8 @@ function initEvents() {
     }
   });
 
-  // 深浅色：跟着系统，但可以手动覆盖
+    // 深浅色：默认深色（默认值写在 <html data-theme="dark"> 上，见 index.html），
+    // 用户手动选过的记在 localStorage 里。这里只负责恢复那个选择 + 切换按钮。
   const btn = $('theme-toggle');
   const root = document.documentElement;
   const saved = localStorage.getItem('fjc-theme');
@@ -1432,9 +2047,13 @@ function initEvents() {
   loadKuhn();
 }
 
-applyStoredParams();   // 必须在 initEvents / refresh 之前 —— chip 与首次请求都读它
+const storedParams = applyStoredParams();   // 必须在 initEvents / refresh 之前 —— chip 与首次请求都读它
 initEvents();
-refresh();
+// 模块尺寸：先把上次存的大小摆回去，再挂监听（顺序反了会把「恢复」当成一次拖动）
+initCardResize();
+// 模型目录要先到（第一次请求才知道该带哪些模型参数）。拉不到就退回默认的 FJC：
+// 页面照常能用，只是「链模型」那张卡只有一个选项。
+loadModels(storedParams.model).catch(() => {}).then(refresh);
 
 /* ---------------- 给 AI 助手的接口 ----------------
  *
@@ -1451,21 +2070,37 @@ refresh();
  * 暴露的是一组动作，不是一个状态对象 —— 写回去以后读 getState() 才是真值。
  */
 window.fjcApp = {
+  // 当前链模型与它的参数（计算 / 3D / 扫描 / 助手共用这一份读法）
+  modelParams,
+
   getState() {
     return {
       n: $('in-n').value,
       l: $('in-l').value,
       normalize: $('in-normalize').checked,
+      model: $('in-model').value,
+      ...modelParams(),
       curves: state.results ? state.results.map((r) => r.n) : [],
     };
   },
 
-  /** 改顶部参数行。n / l 至少给一个。 */
+  /** 改顶部参数行（含链模型与它的参数）。n / l 至少给一个。 */
   async setParams(args) {
-    const { n, l } = args || {};
+    const { n, l, model, theta_deg, cos_phi, p } = args || {};
     const touched = [];
     if (n !== undefined) { $('in-n').value = String(n); touched.push('in-n'); }
     if (l !== undefined) { $('in-l').value = String(l); touched.push('in-l'); }
+    if (model !== undefined) {
+      if (!MODEL_BY_KEY.has(String(model))) {
+        return { ok: false, error: `没有这个链模型：${model}` };
+      }
+      $('in-model').value = String(model);
+      syncModelFields();
+      touched.push('in-model');
+    }
+    if (theta_deg !== undefined) { $('in-theta').value = String(theta_deg); touched.push('in-theta'); }
+    if (cos_phi !== undefined) { $('in-cosphi').value = String(cos_phi); touched.push('in-cosphi'); }
+    if (p !== undefined) { $('in-p').value = String(p); touched.push('in-p'); }
     if (!touched.length) return { ok: false, error: '没给 n 也没给 l' };
 
     touched.forEach((id) => $(id).dispatchEvent(new Event('input', { bubbles: true })));

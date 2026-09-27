@@ -7,6 +7,10 @@
       POST /api/force     {"n": 100, "l": 1.0, "x_max": 10, "temperature": 298.15}
       POST /api/solve_n   {"h": 37.0, "l": 1.0, "kind": "h_rms"}
       GET  /api/kuhn      # Kuhn 长度预置表（唯一的那份在 fjc_core.KUHN_PRESETS）
+      GET  /api/models    # 四个链模型的目录（唯一的那份在 fjc_core.model_catalog()）
+
+      前三个接口都收链模型参数：model（fjc/frc/hindered/wlc，默认 fjc）、
+      theta_deg（键角）、cos_phi（内旋转平均余弦 ⟨cosφ⟩）、p（持久长度，单位 l）。
 
       AI 助手：
       GET  /api/ai/status
@@ -36,10 +40,13 @@ from fjc_core import (
     DEFAULT_TEMPERATURE,
     FJCInputError,
     MAX_CHAINS,
+    ModelParams,
     SWEEP_DEFAULT_CHAINS,
     compute_many,
     force_extension,
     kuhn_presets,
+    model_catalog,
+    model_fingerprint,
     random_chain,
     solve_n,
     sweep,
@@ -75,7 +82,13 @@ def api_compute():
         return jsonify(error=f"最多同时对比 {MAX_CURVES} 条曲线，收到 {len(ns)} 个 n"), 400
 
     try:
-        results = compute_many(ns, payload.get("l", 1.0), CURVE_POINTS)
+        # 模型参数的校验全在 ModelParams.of 一处（键名、范围、默认值），
+        # 这里只负责把它从请求体里取出来。
+        params = ModelParams.of(
+            payload.get("model"), payload.get("theta_deg"),
+            payload.get("cos_phi"), payload.get("p"),
+        )
+        results = compute_many(ns, payload.get("l", 1.0), CURVE_POINTS, params)
     except FJCInputError as e:
         return jsonify(error=str(e)), 400
 
@@ -84,17 +97,22 @@ def api_compute():
 
 @app.post("/api/chain")
 def api_chain():
-    """单链构象模拟：随机生成 chains 条 FJC 链的顶点，供 3D 视图绘制。"""
+    """单链构象模拟：随机生成 chains 条链的顶点，供 3D 视图绘制（按选定的链模型）。"""
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="请求体必须是 JSON 对象"), 400
 
     try:
+        params = ModelParams.of(
+            payload.get("model"), payload.get("theta_deg"),
+            payload.get("cos_phi"), payload.get("p"),
+        )
         result = random_chain(
             payload.get("n"),
             payload.get("l", 1.0),
             payload.get("seed"),
             payload.get("chains", 1),
+            params=params,
         )
     except FJCInputError as e:
         return jsonify(error=str(e)), 400
@@ -114,11 +132,16 @@ def api_sweep():
         return jsonify(error="请求体必须是 JSON 对象"), 400
 
     try:
+        params = ModelParams.of(
+            payload.get("model"), payload.get("theta_deg"),
+            payload.get("cos_phi"), payload.get("p"),
+        )
         result = sweep(
             payload.get("n"),
             payload.get("l", 1.0),
             payload.get("seed"),
             payload.get("chains", SWEEP_DEFAULT_CHAINS),
+            params=params,
         )
     except FJCInputError as e:
         return jsonify(error=str(e)), 400
@@ -186,6 +209,36 @@ def api_kuhn():
         "（温度、立构规整度、溶剂、以及作者给的到底是 p 还是 b）。"
         "这张表用来把 l 填到正确的量级，不是替代文献。"
     ))
+
+
+@app.get("/api/models")
+def api_models():
+    """四个链模型的目录：标签、公式、说明、每个参数的默认值与范围。
+
+    和 /api/kuhn 一个路子 —— **唯一的那份在 `fjc_core.model_catalog()`**，
+    前端不抄第二份，所以界面上那个「链模型」选择器和服务端永远一致。
+    """
+    return jsonify(models=model_catalog())
+
+
+@app.post("/api/model-curves")
+def api_model_curves():
+    """模型的「指纹」：方向关联 ⟨u₀·u_k⟩ 与 Cn(n) 的收敛曲线（纯理论，不采样）。
+
+    给页面上「模型指纹」那张卡片画图用。参数形状与 /api/compute 一致，
+    所以切模型时前端只要把同一组参数再发一遍。
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="请求体必须是 JSON 对象"), 400
+    try:
+        params = ModelParams.of(
+            payload.get("model"), payload.get("theta_deg"),
+            payload.get("cos_phi"), payload.get("p"),
+        )
+    except FJCInputError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(model_fingerprint(params))
 
 
 @app.errorhandler(404)
