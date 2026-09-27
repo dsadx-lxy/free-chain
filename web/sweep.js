@@ -474,7 +474,7 @@
     const d = state.data;
     if (!d) return;
     const out = {
-      tool: '自由连接链（FJC）计算器 —— 链长扫描',
+      tool: '高分子链构象计算器 —— 链长扫描',
       generated: new Date().toISOString(),
       request: { n: d.n, l: d.l, seed: d.seed, chains: d.chains },
       fit: d.slope === null ? null : {

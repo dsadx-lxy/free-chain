@@ -1,4 +1,4 @@
-"""自由连接链（FJC）计算器 —— Flask 后端。
+"""高分子链构象计算器 —— Flask 后端。
 
 页面：GET  /
 接口：POST /api/compute   {"n": 100 | [10,100,1000], "l": 1.0}
@@ -405,7 +405,7 @@ def pick_port(start: int = DEFAULT_PORT, tries: int = 50) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="自由连接链（FJC）计算器")
+    parser = argparse.ArgumentParser(description="高分子链构象计算器")
     parser.add_argument("--port", type=int, default=None,
                         help=f"指定端口（默认从 {DEFAULT_PORT} 起自动找空位）")
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
@@ -421,7 +421,7 @@ def main() -> None:
     port = args.port or pick_port()
     url = f"http://127.0.0.1:{port}"
     print("")
-    print("  自由连接链（FJC）计算器")
+    print("  高分子链构象计算器")
     print(f"  已启动：{url}")
     print("  按 Ctrl+C 停止")
     print("")
