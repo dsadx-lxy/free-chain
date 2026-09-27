@@ -52,7 +52,8 @@ SECRET_FILES = {"ai_config.json", "token.txt", ".gh_token"}   # 1) 凭据：这�
 JUNK_DIRS = {"__pycache__", "dist", ".git", ".claude", ".idea", ".vscode"}
 JUNK_SUFFIXES = (".pyc", ".pyo")                       # 2) 生成物 / 版本控制 / 编辑器残留
 JUNK_PREFIXES = ("~$",)                                #    Office 锁文件
-SLIDES_SUFFIXES = (".pptx", ".ppt", ".key")            # 3) 体积大、与运行无关（可放回）
+SLIDES_SUFFIXES = (".pptx", ".pptm", ".ppt", ".key")   # 3) 体积大、与运行无关（可放回）
+                                                       #    .pptm 是宏格式的汇报稿，同样不该进包
 
 # 二进制不需要按文本扫 key
 BINARY_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
@@ -164,7 +165,7 @@ def main(argv=None) -> int:
     ap.add_argument("--version", help="版本号，决定文件名；默认用当天日期")
     ap.add_argument("--out", default="dist", help="输出目录，默认 dist/")
     ap.add_argument("--with-slides", action="store_true",
-                    help="把 .pptx 汇报稿也放进去（默认不放：5MB，与运行无关）")
+                    help="把 .pptx / .pptm 汇报稿也放进去（默认不放：与运行无关）")
     ap.add_argument("--list", action="store_true", help="只打印清单，不写 zip")
     ap.add_argument("--force", action="store_true", help="覆盖已存在的同名 zip")
     args = ap.parse_args(argv)
@@ -218,7 +219,7 @@ def main(argv=None) -> int:
     print("  复检通过：无凭据文件、无字节码、无锁文件"
           + (f"；已用本机 {len(secrets)} 条凭据原文扫过全部文本内容" if secrets else ""))
     if not args.with_slides:
-        print("  注：汇报 pptx 没打进去，要的话加 --with-slides。")
+        print("  注：汇报 pptx / pptm 没打进去，要的话加 --with-slides。")
     return 0
 
 
