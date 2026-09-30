@@ -1,37 +1,45 @@
-name: Automated Release with Claude (PAT Version)
+name: Release
 
 on:
   push:
     tags:
-      - 'v*' # 当你在本地打版本号 Tag（例如 v1.0.0）并推送时，自动触发发布
+      - 'v[0-9]+.[0-9]+.[0-9]+' # 只匹配 v1.2.3 这种正式版本号
+
+permissions:
+  contents: write # 创建 Release 只需要这一项
 
 jobs:
-  build-and-release:
+  release:
     runs-on: ubuntu-latest
     steps:
-      # 1. 检出完整的代码提交历史
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          token: ${{ secrets.MY_GITHUB_PAT }} 
+          fetch-depth: 0 # 需要完整历史和所有 tag 才能算出两个版本之间的提交
 
-      # 2. 让 Claude 分析你的 Commit 记录并自动生成中文 Release Notes
-      - name: Generate Changelog with Claude
-        id: claude_changelog
-        uses: mistricky/ccc@v1
-        with:
-          github_token: ${{ secrets.MY_GITHUB_PAT }} 
-          anthropic_api_key: ${{ secrets.AARON_CLAUDE_LINK }}
-          model: "claude-3-7-sonnet"
+      - name: Generate release notes
+        run: |
+          prev=$(git tag --list --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -vx "$GITHUB_REF_NAME" \
+            | while read -r t; do
+                if git merge-base --is-ancestor "$t" "$GITHUB_REF_NAME"; then echo "$t"; break; fi
+              done)
+          range=${prev:+$prev..}$GITHUB_REF_NAME
+          {
+            echo "## 更新内容"
+            echo
+            git log "$range" --no-merges --format='- %s (%h, %an)'
+            echo
+            if [ -n "$prev" ]; then
+              echo "完整对比：https://github.com/${{ github.repository }}/compare/$prev...$GITHUB_REF_NAME"
+            fi
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
 
-      # 3. 自动帮你把 Release 发出去
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.MY_GITHUB_PAT }} 
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          body: ${{ steps.claude_changelog.outputs.result }} 
-          draft: false
-          prerelease: false
+          body_path: RELEASE_NOTES.md
