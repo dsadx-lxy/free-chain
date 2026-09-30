@@ -1,0 +1,37 @@
+name: Automated Release with Claude (PAT Version)
+
+on:
+  push:
+    tags:
+      - 'v*' # 当你在本地打版本号 Tag（例如 v1.0.0）并推送时，自动触发发布
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出完整的代码提交历史
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MY_GITHUB_PAT }} 
+
+      # 2. 让 Claude 分析你的 Commit 记录并自动生成中文 Release Notes
+      - name: Generate Changelog with Claude
+        id: claude_changelog
+        uses: mistricky/ccc@v1
+        with:
+          github_token: ${{ secrets.MY_GITHUB_PAT }} 
+          anthropic_api_key: ${{ secrets.AARON_CLAUDE_LINK }}
+          model: "claude-3-7-sonnet"
+
+      # 3. 自动帮你把 Release 发出去
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.MY_GITHUB_PAT }} 
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: ${{ steps.claude_changelog.outputs.result }} 
+          draft: false
+          prerelease: false
