@@ -67,6 +67,16 @@
     return out;
   }
 
+  /**
+   * 逐级放宽「哪一档可以标值」：正常是 10^k；坐标域正好落在两个 10^k 之间时
+   * （比如 n 只填 300 和 400）连 2/5 都不在域内，一直放宽到细分，
+   * 总要让轴上有数可读。
+   */
+  function labelledKinds(ticks) {
+    const sets = [['major'], ['major', 'grid'], ['major', 'grid', 'minor']];
+    return sets.find((s) => ticks.some((t) => s.includes(t.kind))) || sets[0];
+  }
+
   /* ---------------- 画图 ---------------- */
 
   function drawEmpty(svg) {
@@ -129,13 +139,9 @@
     //  1) 贴着边框的那一两个刻度（坐标域边缘刚好切进 4、9 这种）离轴线不到一个像素，
     //     画出来是噪点而不是刻度，所以只留白不留痕 —— 但**标了值的**不吃这道护栏，
     //     宁可让一条网格线和轴线重合（画在轴线底下，看不出来），也不能让轴上的数字消失。
-    //  2) 逐级放宽「哪一档可以标值」：正常是 10^k；坐标域正好落在两个 10^k 之间时
-    //     （比如 n 只填 300 和 400）连 2/5 都不在域内，一直放宽到细分，总要让轴上有数可读。
+    //  2) 逐级放宽「哪一档可以标值」的规则在 labelledKinds 里（和 logTicks 一样提到了
+    //     模块作用域，好让 saw.js 复用同一份，见文件末尾的 window.fjcSweepHelpers）。
     const INSET = 7;
-    const labelledKinds = (ticks) => {
-      const sets = [['major'], ['major', 'grid'], ['major', 'grid', 'minor']];
-      return sets.find((s) => ticks.some((t) => s.includes(t.kind))) || sets[0];
-    };
     const grid = el('g', {}, svg);
 
     const yts = logTicks(ylo, yhi);
@@ -509,6 +515,11 @@
   }
 
   async function run() {
+    // 扫描的是**本模型自己的** ⟨h²⟩(n) 理论线，自回避行走没有这条线。
+    // 卡片这时已经被 CSS 收起来、按钮点不到，这条只是防止将来别处再调它。
+    const spec = window.fjcApp ? window.fjcApp.modelSpec() : null;
+    if (spec && !spec.analytic) return;
+
     let ns;
     let l;
     let chains;
@@ -655,6 +666,11 @@
   }
 
   /* ---------------- 启动 ---------------- */
+
+  // 两个纯刻度函数给 saw.js 用。它是另一张**同规格**的双对数图（同一个 viewBox、
+  // 同一套轴约定），刻度逻辑一个字都不该有第二个版本 —— 所以挂出来复用，
+  // 而不是在那边抄一遍。挂 window 是因为两个文件各在自己的 IIFE 里，词法环境不共享。
+  window.fjcSweepHelpers = { logTicks, labelledKinds };
 
   // 深浅色不用管：这张图是 SVG，fill/stroke 都是 CSS 变量，主题一变自动跟上
   // （P(h) 那张要重绘是因为 canvas 解析不了 CSS 变量，这里没这个问题）。

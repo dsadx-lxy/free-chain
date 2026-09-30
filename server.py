@@ -4,13 +4,21 @@
 接口：POST /api/compute   {"n": 100 | [10,100,1000], "l": 1.0}
       POST /api/chain     {"n": 1000, "l": 1.0, "seed": 12345, "chains": 1}
       POST /api/sweep     {"n": [10,30,100,300,1000,3000], "chains": 10000}
+      POST /api/saw/chain {"n": 20, "l": 1.0, "seed": 12345, "chains": 3}
+      POST /api/saw/sweep {"n": [5,8,12,16,20,25,30], "chains": 1000}
       POST /api/force     {"n": 100, "l": 1.0, "x_max": 10, "temperature": 298.15}
       POST /api/solve_n   {"h": 37.0, "l": 1.0, "kind": "h_rms"}
       GET  /api/kuhn      # Kuhn 长度预置表（唯一的那份在 fjc_core.KUHN_PRESETS）
-      GET  /api/models    # 四个链模型的目录（唯一的那份在 fjc_core.model_catalog()）
+      GET  /api/models    # 链模型目录（唯一的那份在 fjc_core.model_catalog()）
+                          # 四个解析模型 + 自回避行走，用 analytic 这一位区分
+      POST /api/model-curves  # 模型指纹：方向关联与 Cn 的收敛（纯理论，不采样）
+      POST /api/energy        # 能量图景：受阻旋转链的位垒 / 蠕虫状链的弯曲刚度
+                              # 另外两个模型返 kind="none" —— 它们没有能量自由度
 
       前三个接口都收链模型参数：model（fjc/frc/hindered/wlc，默认 fjc）、
       theta_deg（键角）、cos_phi（内旋转平均余弦 ⟨cosφ⟩）、p（持久长度，单位 l）。
+      **两个 /api/saw/* 不收** —— 自回避行走没有闭式 ⟨h²⟩，不进那四个模型，
+      详见 fjc_core.py 里「自回避行走」那一节的开头。
 
       AI 助手：
       GET  /api/ai/status
@@ -41,13 +49,18 @@ from fjc_core import (
     FJCInputError,
     MAX_CHAINS,
     ModelParams,
+    SAW_CHAINS_MAX,
+    SAW_DEFAULT_CHAINS,
     SWEEP_DEFAULT_CHAINS,
     compute_many,
+    energy_figure,
     force_extension,
     kuhn_presets,
     model_catalog,
     model_fingerprint,
     random_chain,
+    saw_chain,
+    saw_sweep,
     solve_n,
     sweep,
 )
@@ -149,6 +162,59 @@ def api_sweep():
     return jsonify(result.to_dict())
 
 
+@app.post("/api/saw/chain")
+def api_saw_chain():
+    """自回避行走的单链构象：`chains` 条格点 SAW，外加同 n 的理想链对照。
+
+    **不收链模型参数** —— 自回避行走没有闭式 ⟨h²⟩，不属于那四个解析模型，
+    也不吃 θ / ⟨cosφ⟩ / p（格点上只有 6 个单位方向）。请求体里多带的字段
+    会被忽略，不报错：前端复用一个参数面板时省得剔除。
+
+    n ≤ 30 是**算力上限**（严格拒绝采样的存活率按 0.78^n 衰减），超了是 400
+    而不是静默夹取 —— 卡片的 3D 视图要自己把这句话显示出来。
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="请求体必须是 JSON 对象"), 400
+
+    try:
+        result = saw_chain(
+            payload.get("n"),
+            payload.get("l", 1.0),
+            payload.get("seed"),
+            payload.get("chains", 1),
+        )
+    except FJCInputError as e:
+        return jsonify(error=str(e)), 400
+
+    return jsonify(result.to_dict())
+
+
+@app.post("/api/saw/sweep")
+def api_saw_sweep():
+    """自回避行走的标度扫描：每个 n 采 `chains` 条链，拟合 ⟨R²⟩ ∝ n^(2ν)。
+
+    比 /api/sweep 慢得多 —— 而且**慢得不成比例**：5000 条链在 n=5 是秒级，
+    在 n=30 是分钟级。所以超预算时这里返回 400 并说清要多少钱，
+    而不是把用户按在转圈的界面前面。
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="请求体必须是 JSON 对象"), 400
+
+    try:
+        result = saw_sweep(
+            payload.get("n"),
+            payload.get("l", 1.0),
+            payload.get("seed"),
+            payload.get("chains", SAW_DEFAULT_CHAINS),
+        )
+    except FJCInputError as e:
+        return jsonify(error=str(e)), 400
+
+    return jsonify(result.to_dict())
+
+
 @app.post("/api/force")
 def api_force():
     """力–伸长曲线：λ(x) = Langevin(x)，横轴是无量纲力 f·l/(k_BT)。
@@ -239,6 +305,31 @@ def api_model_curves():
     except FJCInputError as e:
         return jsonify(error=str(e)), 400
     return jsonify(model_fingerprint(params))
+
+
+@app.post("/api/energy")
+def api_energy():
+    """「能量图景」：只有真有能量自由度的两个模型才有内容。
+
+    受阻旋转链给内旋转势垒下的三态（trans 0°、gauche± ±120°）与 Cn 随位垒；
+    蠕虫状链给弯曲势 U/kT = κ(1−cosθ) 下的键角余弦分布与 p/l 随 κ。
+    自由连接链 / 自由旋转链返回 kind="none" 加一句中文理由 ——
+    **为什么它们没有**这件事只写在 fjc_core.energy_figure() 一处，
+    前端拿到 none 就什么都不画，不再自己判断模型。
+
+    参数形状与 /api/model-curves 完全一致，切模型时前端把同一组参数再发一遍即可。
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="请求体必须是 JSON 对象"), 400
+    try:
+        params = ModelParams.of(
+            payload.get("model"), payload.get("theta_deg"),
+            payload.get("cos_phi"), payload.get("p"),
+        )
+    except FJCInputError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(energy_figure(params))
 
 
 @app.errorhandler(404)

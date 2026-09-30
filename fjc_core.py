@@ -630,8 +630,16 @@ def model_note(mp: ModelParams) -> str:
             f"方向关联按 cosθ 逐段衰减，求和得 Cn = (1−cosθ)/(1+cosθ)；θ=90° 时退回 FJC。"
         )
     if mp.key == MODEL_HINDERED:
+        # 「受阻」两个字的量化说法：三态里 gauche 相对 trans 的能量差。读数就是
+        # 能量图景那张卡画的东西 —— 两个入口共用 hindered_barrier() 这一份换算。
+        sigma, delta_e, _ = hindered_barrier(mp.cos_phi)
+        ratio = "∞（gauche 完全占优）" if not math.isfinite(sigma) else f"{sigma:.3g}"
+        barrier = "−∞" if not math.isfinite(delta_e) else f"{delta_e:.2f} kT"
         return (
             f"键角固定为 {mp.theta_deg:g}°，再叠加内旋转势垒（平均余弦 ⟨cosφ⟩ = {mp.cos_phi:g}）。"
+            f"三态模型里 trans 在 φ=0°、gauche± 在 φ=±120°；gauche 与 trans 的布居比 "
+            f"σ = {ratio}，对应能量差 ΔE = {barrier}（σ = e^(−ΔE/kT)）——ΔE = 0 时三态等权重，"
+            f"正好退回自由旋转链。"
             f"经典近似下就是几何因子再乘 (1+⟨cosφ⟩)/(1−⟨cosφ⟩) —— 聚乙烯 θ=109.47°、⟨cosφ⟩≈0.5 "
             f"时 Cn ≈ 6，正好对上实测的 C∞ ≈ 6.7。"
         )
@@ -765,6 +773,325 @@ def _step_vectors_model(mp: ModelParams, rng, chains: int, n: int) -> np.ndarray
         ph = phi[:, i][:, None]
         out[:, i] = c * u_prev + s * (np.cos(ph) * e1 + np.sin(ph) * e2)
     return out
+
+
+# --- 能量图景 -----------------------------------------------------------------
+#
+# 四个解析模型里**只有两个有真正的能量自由度**：
+#
+#   * 受阻旋转链 —— 内旋转势垒。trans(φ=0) 与 gauche±(φ=±120°) 的能量不同，
+#     这个差就是 `_torsion_steps()` 那行 p_trans = (2⟨cosφ⟩+1)/3 的全部来源。
+#   * 蠕虫状链   —— 弯曲刚度 κ。相邻键对齐与否能量不同，`_step_vectors_model()`
+#     的 WLC 分支抽的 p(x) ∝ e^(κx) 正是势 U/kT = κ(1−cosθ) 的玻尔兹曼分布。
+#
+# 另外两个没有：自由连接链除固定键长外没有任何约束（势恒为 0），自由旋转链的
+# 键角是**硬约束**不是势（绕键自由旋转）。给它们画能量图只能画出平线或 δ 峰，
+# 零信息，所以 energy_figure() 对它们返回 kind="none" 与一句中文理由 ——
+# 这条分支不是死代码，它是「为什么这两个模型没有能量图」在后端的**唯一**落点：
+# 测试钉它、README 引它，前端不必为它写 if。
+#
+# 两条式子都是**精确**的，不是拟合：
+#
+#   ΔE/kT = ln((1 + 2c)/(1 − c))        c ≡ ⟨cosφ⟩，gauche 相对 trans 的能量差
+#   κ 由 L(κ) = e^(−l/p) 定出，大 p/l 端 κ ≈ p/l + 1/2
+#
+# 受阻旋转链那张图上画的 U(φ) 是一条**曲线**，而采样器抽的是三个**离散**值 ——
+# 这两件事别混：曲线画的是**势**（井底落在 0°/±120° 三个态上，井深差就是 ΔE），
+# 三根柱画的是**布居**。这条曲线的**井底位置与井深**由模型定死，**势垒高度**则
+# 纯属画法约定（TORSION_BARRIER_RATIO）—— 模型只给了 ΔE 一个数，画一条曲线还需要
+# 形状。而且对这条连续曲线积出来的玻尔兹曼权重**不等于**三态权重（三态是离散近似）。
+#
+# 两条都有一处**接缝**，是这套图最值得画的地方：c = 0 ⇒ ΔE = 0 ⇒ 受阻旋转链与
+# 自由旋转链精确重合（U(φ) 在那里退化成一条平线）；κ → 0 ⇒ 键角分布变均匀 ⇒
+# 蠕虫状链退回自由连接链。
+
+# Cn–位垒那张图的横轴下限。ΔE → −∞（cos_phi → COS_PHI_MIN，全部 gauche）画不出来，
+# 截断在 −3：那里 Cn 与它的下界 Cn_FRC/3 只差 0.3%（(1+2e⁻³)/3 = 0.3665 对 1/3）。
+ENERGY_CN_DELTA_MIN = -3.0
+ENERGY_CN_POINTS = 240
+
+# 内旋转势 U(φ) 那条曲线的取样点数：−180°…180°，1.5° 一格。
+# 0°/±60°/±120°/±180° 全都**正好落在格点上**（360/240 × 整数），所以
+# 井底与几个极值点不需要插值 —— 图上那三个点与曲线的极小点是同一个数。
+ENERGY_TORSION_POINTS = 241
+
+# **约定**，不是物理：两个 gauche 井之间的势垒取成 |ΔE| 的多少倍。
+# 模型本身只定死一个数 —— 井深差 ΔE（由 ⟨cosφ⟩ 精确换算）—— 而一条曲线还需要
+# **形状**，也就是势垒得多高；这不是模型的预言，必须另外约定一个。
+# 基准取 gauche↔gauche 那一处，是因为它连接的是**两个等价的井**，「比更高的那个
+# 井高多少」在那里没有歧义；trans↔gauche 那处连接的两个井不等高（相差 ΔE），
+# 拿它做基准还得再约定一次以谁为准。
+# 取 4 的一个旁证：聚乙烯（ΔE = ln 4 = 1.386 kT）由此得到 5.545 kT = 13.7 kJ/mol，
+# 与聚乙烯真实的内旋转势垒（约 3 kcal/mol ≈ 12.6 kJ/mol）同量级。
+TORSION_BARRIER_RATIO = 4.0
+
+# 摩尔气体常数，J/(mol·K)。2019 年 SI 修订之后 k_B 与 N_A 都是定义精确值，
+# 所以 R = k_B·N_A 也是精确的 —— 与力–伸长那节的 K_B 同源，不是测量值。
+# 只用在曲线纵轴的 kJ/mol 换算说明上。
+R_GAS = 8.31446261815324
+
+# 持久长度–刚度那张图的 κ 扫描范围。上限取 _wlc_kappa 二分上界的一半以上，
+# 覆盖到 p = P_MAX = 300（那时 κ ≈ 300.5）；下限 0.01 对应 p/l ≈ 0.175。
+ENERGY_KAPPA_MIN = 0.01
+ENERGY_KAPPA_MAX = 400.0
+ENERGY_KAPPA_POINTS = 240
+
+
+def hindered_barrier(cos_phi: float) -> tuple[float, float, float]:
+    """受阻旋转链的三态位垒：(σ, ΔE/kT, p_trans)。
+
+    σ 是**单个** gauche 态相对 trans 态的玻尔兹曼因子。gauche 有两个（±120°），
+    把 ⟨cosφ⟩ 按三态展开就能解出它：
+
+        ⟨cosφ⟩ = p_trans·1 + (1 − p_trans)·(−1/2)
+        p_trans = 1/(1 + 2σ)   ⇒   σ = (1 − ⟨cosφ⟩)/(1 + 2⟨cosφ⟩)
+
+    ΔE = −kT·ln σ 就是 gauche 相对 trans 的能量差 —— 位垒滑块上那个 (kT) 数。
+    这里算出的 p_trans 与 `_torsion_steps()` 用的 (2c+1)/3 是**同一个数**
+    （代换上恒等，测试逐点钉着）—— 所以图上画的就是采样器真正在用的分布。
+
+    cos_phi = COS_PHI_MIN = −0.5 时 σ → ∞、ΔE → −∞（全部链段走 gauche）。
+    这里如实返回 inf，**由调用方**格式化成「−∞（全 gauche）」，
+    绝不把 inf 塞进 JSON（`json.dumps` 会写成 `-Infinity`，JS 的 JSON.parse 直接报错）。
+    """
+    c = float(cos_phi)
+    denom = 1.0 + 2.0 * c
+    if denom <= 0.0:
+        return math.inf, -math.inf, 0.0
+    sigma = (1.0 - c) / denom
+    p_trans = 1.0 / (1.0 + 2.0 * sigma)
+    delta_e = -math.log(sigma) if sigma > 0.0 else math.inf
+    if delta_e == 0.0:
+        delta_e = 0.0                     # c = 0 时 -log(1.0) 是 -0.0，收拾干净
+    return sigma, delta_e, p_trans
+
+
+def hindered_potential(delta_e_over_kt: float) -> tuple[list[float], list[float]]:
+    """内旋转势那条曲线：(φ/°, U/kT)，各 ENERGY_TORSION_POINTS 个点。
+
+    取的是**已截断过**的 ΔE（`all_gauche` 时是 ENERGY_CN_DELTA_MIN）—— 截断判断
+    在 `energy_figure()` 里只做一次，这里不重复。
+
+    三态模型只说了「φ 取 0°（trans）与 ±120°（gauche±）三个值，井深差 ΔE」。
+    要把这条能量画成一条曲线，就得造一个**以这三个值为井底**的三井势：
+
+        U(φ) = α·(cos φ + ½·cos 2φ) + a₃·cos 3φ − (3α/2 + a₃)，   α = −4ΔE/9
+
+    α 是**解出来的、不是选的**：要求极值正好落在 0° 与 ±120° 上，
+    求导 dU/dφ = −sinφ·(a₁ + 2a₂cosφ) − 3a₃·sin3φ 在 120° 那一点要求
+    a₁ + 2a₂·cos120° = 0，即 a₁ = 2a₂（0° 在 a₁ = 2a₂ 下自动满足）；
+    再用 U(±120°) − U(0°) = ΔE 定标，就得到 α = a₁ = 2a₂ = −4ΔE/9。
+    常数项把 U(0°) 钉在 0 —— trans 是能量零点。
+
+    **这条曲线不是 120° 周期的**（别被「三井」骗了）：井底间距确实是 120°、三口井
+    一样深，但两条势垒不一样高（见下），而 120° 周期会强制它们一样高。整条曲线是
+    **360° 周期**的：三个井在 0°/±120°，极大点在 ±60° 附近与 ±180°。
+
+    a₃ 是**唯一自由的形状参数**（势垒高度），按 TORSION_BARRIER_RATIO 那条约定取：
+
+        a₃ = −ΔE/18 − 2|ΔE|   ⇒   两个 gauche 井之间的势垒 = TORSION_BARRIER_RATIO·|ΔE|
+
+    里面那个绝对值是必需的：⟨cosφ⟩ < 0 时 gauche 比 trans **低**，井深差是负的，
+    而势垒高度不能跟着变负 —— 写成 −20ΔE/9 的话，ΔE < 0 时 0°/±120° 会从极小点
+    翻成极大点，**井底就跑掉了**。取 |ΔE| 之后两边都对：三个井仍都在 0°/±120°，
+    只是 ΔE < 0 时 0° 那个井被抬到两个 gauche 井**上面** —— 正是「gauche 更稳」的样子。
+    **但不是把曲线整体翻过来**：极小点位置一个没动，变的是三个井的相对高度。
+
+    一个结构性的推论（不是选择）：**trans↔gauche 那条势垒总比 gauche↔gauche 那条低**，
+    ΔE > 0 时约低 |ΔE|/3（实测 ≈ 3.68|ΔE| 对 4|ΔE|），ΔE < 0 时约低 2|ΔE|/3
+    （≈ 3.35|ΔE|）。两者的差由 α 唯一决定，换任何 a₃ 都消不掉。
+    **只有 gauche↔gauche 那条有精确值 4|ΔE|** —— 它是构造出来的；trans↔gauche 那条
+    的顶点由 −α(sinφ + sin2φ) = 3a₃·sin3φ 定，是个超越方程，没有闭式，
+    所以那个数由 `energy_figure()` **从画出来的曲线上直接量**，不在这里假造一个公式。
+    顺带：两条势垒的顶点都落在 ±60° 附近但**不正好在** ±60°（实测偏到 57°~63°）——
+    被 a₁ = 2a₂ 钉死的是 0°/±120° 那三个**井底**，顶点位置是自由的。
+
+    两个接缝：
+      ΔE = 0 ⇒ α = a₃ = 0 ⇒ **U ≡ 0**，一条平线 —— 这正是「绕键自由旋转」的诚实
+        画法，也正是 `model_h2()` 里受阻旋转链精确退回自由旋转链的那一格。
+      ΔE < 0 ⇒ 0° 那个井被抬到两个 gauche 井上面（见上）。
+
+    **这条曲线的玻尔兹曼分布不等于三态权重**：三态是**离散**近似，对连续 U(φ)
+    积分出来的权重与 p_trans = (2c+1)/3 不是同一个数。这条曲线说的是「ΔE 是从哪
+    来的」，不是「采样器在按它抽」—— 画布上那张分布图照旧只画三根柱。
+    """
+    d_e = float(delta_e_over_kt)
+    alpha = -4.0 * d_e / 9.0
+    a3 = -d_e / 18.0 - 2.0 * abs(d_e)
+    const = -(1.5 * alpha + a3)
+    phis = [-180.0 + 360.0 * i / (ENERGY_TORSION_POINTS - 1)
+            for i in range(ENERGY_TORSION_POINTS)]
+    us = []
+    for p in phis:
+        t = math.radians(p)
+        us.append(alpha * (math.cos(t) + 0.5 * math.cos(2.0 * t))
+                  + a3 * math.cos(3.0 * t) + const)
+    # ΔE = 0 时三项正好抵消成 0，但可能出现 −0.0，JSON 里会写成 "-0.0"
+    # （hindered_barrier 里对 delta_e 做过同一件事）。加一个 0.0 掰回 +0.0，
+    # IEEE 下 −0.0 + 0.0 = +0.0，非零值不受影响。
+    return phis, [u + 0.0 for u in us]
+
+
+def wlc_bending(p: float) -> tuple[float, float, float]:
+    """蠕虫状链的弯曲刚度：(κ, p/l, ⟨cosθ⟩)。
+
+    κ 解自 L(κ) = e^(−l/p)，用的就是采样器那个 `_wlc_kappa()`。所以
+    ⟨cosθ⟩ = L(κ) = e^(−l/p) 是**构造出来的恒等式**而不是近似 ——
+    页面上模型指纹卡的 corr[1] 是这个同一个数，两处能对上。
+
+    能量读法：采样器抽的 p(x) ∝ e^(κx) 就是势 U(cosθ)/kT = κ(1 − cosθ) 的
+    玻尔兹曼分布，值域 0（相邻键完全对齐）… 2κ（完全反向）。
+    """
+    corr = math.exp(-1.0 / float(p))
+    return _wlc_kappa(corr), float(p), corr
+
+
+def _wlc_density(kappa: float, x: np.ndarray) -> np.ndarray:
+    """p(x) ∝ e^(κx) 在 [−1,1] 上的归一化密度：p = κ·e^(κx) / (2 sinh κ)。
+
+    走 log 空间算：κ 到 300 时 e^(κx) 与 sinh κ 都贴着 double 的上限
+    （e^300 ≈ 2×10¹³⁰），而 log 形式只要 κx − log(2 sinh κ / κ)，全程安全；
+    小 κ 端 2 sinh κ / κ → 2，log 也不退化。x = ±1 两端正好是 0 与 κ 的密度。
+    """
+    log_z = math.log(2.0) if kappa < 1e-9 else math.log(2.0 * math.sinh(kappa) / kappa)
+    return np.exp(kappa * x - log_z)
+
+
+def energy_figure(mp: ModelParams) -> dict:
+    """「能量图景」那张卡片要的全部数据。**唯一一份**，/api/energy 原样吐出去。
+
+    前端一个公式都不写 —— 和 model_fingerprint() / force_extension() 同一条规矩。
+    本函数只算「这个模型的能量长什么样」，不碰 ⟨h²⟩ 的公式层。
+    """
+    if mp.key == MODEL_HINDERED:
+        sigma, delta_e, p_trans = hindered_barrier(mp.cos_phi)
+        # 指数一过 709 就溢出，这里也顺手把 ΔE 封顶到 COS_PHI_MAX 对应的那个值
+        delta_max = math.log((1.0 + 2.0 * COS_PHI_MAX) / (1.0 - COS_PHI_MAX))
+
+        # Cn 随位垒：逐点回 model_kuhn_over_l() 现算，不在这里抄第二遍位垒公式。
+        # σ = e^(−ΔE) ⇒ ⟨cosφ⟩ = (1−σ)/(1+2σ) 是 hindered_barrier 的逆变换。
+        ds = np.linspace(ENERGY_CN_DELTA_MIN, delta_max, ENERGY_CN_POINTS)
+        cn_curve = [
+            model_kuhn_over_l(ModelParams.of(
+                MODEL_HINDERED, theta_deg=mp.theta_deg,
+                # 端点会因浮点落在 COS_PHI_MIN/MAX 外一点点，夹回去；
+                # 夹的是网格端点而不是物理，误差在 1e-15 量级
+                cos_phi=min(max((1.0 - math.exp(-d)) / (1.0 + 2.0 * math.exp(-d)),
+                                COS_PHI_MIN), COS_PHI_MAX),
+            ))
+            for d in ds
+        ]
+        cn_frc = model_kuhn_over_l(ModelParams.of(MODEL_FRC, theta_deg=mp.theta_deg))
+        p_gauche = (1.0 - p_trans) / 2.0
+        # σ = ∞ 正是「全部走 gauche」那一个端点。写成 `not isfinite(delta_e)` 也能跑，
+        # 但 ΔE 在另一端（σ = 0，全 trans）同样不是有限数 —— 那一点被 COS_PHI_MAX = 0.99
+        # 挡在参数范围外，而按 σ 判就不会在这两件事上留下混同的余地。
+        all_gauche = sigma == math.inf
+        u_gauche = ENERGY_CN_DELTA_MIN if all_gauche else delta_e
+
+        # 那条 U(φ) 曲线。传进去的是**已经截断过**的 u_gauche，不重复上面那次判断。
+        phi_deg, u_potential = hindered_potential(u_gauche)
+        # 两条势垒**从画出来的曲线上直接量**，读数与图必然一致：
+        #   gauche↔gauche：120°…180° 段的最高点 − U(120°)
+        #   trans↔gauche：0°…120° 段的最高点 − 两者中**较高**的那个井
+        #     （ΔE > 0 时较高的是 gauche，ΔE < 0 时是 trans）
+        # 两个都恒有限：u_gauche 是截断值，all_gauche 时是 −3 而不是 −∞。
+        u_trans = u_potential[phi_deg.index(0.0)]
+        gg_barrier = max(u for p, u in zip(phi_deg, u_potential)
+                         if p >= 120.0) - u_gauche
+        tg_barrier = max(u for p, u in zip(phi_deg, u_potential)
+                         if 0.0 <= p <= 120.0) - max(u_trans, u_gauche)
+
+        return {
+            "model": mp.key,
+            "kind": "torsion",
+            "theta_deg": mp.theta_deg,
+            "cos_phi": mp.cos_phi,
+            "barrier": {
+                # None 表示 −∞（全 gauche）：JSON 里不能出现 Infinity
+                "sigma": None if not math.isfinite(sigma) else sigma,
+                "delta_e_over_kt": None if not math.isfinite(delta_e) else delta_e,
+                "p_trans": p_trans,
+                "all_gauche": all_gauche,
+                # 势垒高度是**约定**（TORSION_BARRIER_RATIO），不是模型的预言 ——
+                # 模型只定死井深差 ΔE。all_gauche 时这两个数建在截断值 −3 上，
+                # 读数行要注明，别让 12 kT 看着像真值。
+                "gg_over_kt": gg_barrier,
+                "tg_over_kt": tg_barrier,
+            },
+            # 三井势 U(φ)/kT（**360° 周期、不是 120°**，见 hindered_potential()），
+            # 井底正好落在下面 levels 那三个 φ 上。
+            # 这是**势**（模型的输入），不是布居 —— 右栏那三根柱才是布居（模型的输出）。
+            # 对这条曲线做玻尔兹曼积分**不等于**那三根柱，见 hindered_potential()。
+            "phi_deg": phi_deg,
+            "potential": u_potential,
+            "u_max": max(u_potential),
+            "u_min": min(u_potential),
+            # 纵轴的 kJ/mol 换算（R·T，T 用 DEFAULT_TEMPERATURE）。只用来说明刻度 ——
+            # **不做第二根纵轴**，换算写进轴标题的文字里。
+            "kt_in_kj_per_mol": R_GAS * DEFAULT_TEMPERATURE / 1000.0,
+            # 三态，**离散**的三个值 —— 采样器抽的就是这三个。上面那条 U(φ) 曲线画的
+            # 是**势**（井底落在这三个 φ 上），**不是** φ 的分布；两者别混。
+            "levels": [
+                {"phi_deg": 0.0, "cos_phi": 1.0, "name": "trans",
+                 "u_over_kt": 0.0, "weight": p_trans},
+                {"phi_deg": 120.0, "cos_phi": -0.5, "name": "gauche+",
+                 "u_over_kt": u_gauche, "weight": p_gauche},
+                {"phi_deg": -120.0, "cos_phi": -0.5, "name": "gauche−",
+                 "u_over_kt": u_gauche, "weight": p_gauche},
+            ],
+            "cn": {
+                "now": model_kuhn_over_l(mp),
+                "frc": cn_frc,
+                "delta_e": ds.tolist(),
+                "values": cn_curve,
+                # 聚乙烯那个点：θ = 109.47°、⟨cosφ⟩ = 0.5
+                "pe_delta_e": math.log(4.0),
+                "pe_cn": model_kuhn_over_l(ModelParams.of(
+                    MODEL_HINDERED, theta_deg=DEFAULT_THETA_DEG, cos_phi=0.5)),
+            },
+            "delta_max": delta_max,
+        }
+
+    if mp.key == MODEL_WLC:
+        kappa, p_over_l, corr = wlc_bending(mp.p)
+        xs = np.linspace(-1.0, 1.0, CURVE_POINTS)
+        # 持久长度随弯曲刚度：改用 log 均匀的 κ 网格，小 κ 那一端的弯折才看得见
+        ks = np.logspace(math.log10(ENERGY_KAPPA_MIN),
+                         math.log10(ENERGY_KAPPA_MAX), ENERGY_KAPPA_POINTS)
+        # p/l = −1/ln L(κ)：就是 wlc_bending 的反函数，大 κ 端趋于 κ − 1/2
+        ks_list = ks.tolist()
+        pl = [-1.0 / math.log(_langevin(k)) for k in ks_list]
+        return {
+            "model": mp.key,
+            "kind": "bending",
+            "p": mp.p,
+            "kappa": kappa,
+            "p_over_l": p_over_l,
+            "corr": corr,
+            "cos": xs.tolist(),
+            # U/kT = κ(1 − cosθ)：0 是相邻键对齐，2κ 是完全反向
+            "potential": (kappa * (1.0 - xs)).tolist(),
+            "density": _wlc_density(kappa, xs).tolist(),
+            "u_max": 2.0 * kappa,
+            "kappa_scan": ks_list,
+            "pl_scan": pl,
+            # 渐近 κ ≈ p/l + 1/2（由 l/p = −ln L(κ) ≈ 1/κ + 1/(2κ²) 得来）。
+            # 只给 κ ≥ 1 那一段：再往左它就给不出正数了，而那正是渐近本身失效的地方
+            # —— 画在**对数**纵轴上会变成 NaN，不如后端就不发。
+            "pl_asymptote": [[k, k - 0.5] for k in ks_list if k >= 1.0],
+        }
+
+    # fjc / frc：没有能量自由度。理由写在后端一处，前端不必为它写 if
+    reason = (
+        "自由连接链除了固定键长之外没有任何约束：链段取向各向同性、彼此独立，"
+        "等价于势能恒为 0。没有能量自由度，画不出能量图。"
+        if mp.key == MODEL_FJC else
+        "自由旋转链的键角是**硬约束**不是势：相邻键矢量的夹角被钉死，绕键的旋转完全自由。"
+        "约束不贡献能量自由度（它只在 ⟨h²⟩ 里给出 (1−cosθ)/(1+cosθ) 那个几何因子），"
+        "所以画不出能量图。"
+    )
+    return {"model": mp.key, "kind": "none", "reason": reason}
 
 
 def validate(n, l) -> tuple[int, float]:
@@ -1217,11 +1544,49 @@ def freerotating_h2(n: int, l: float, theta_deg: float) -> float:
     return n * l * l * (1.0 - c) / (1.0 + c)
 
 
+def _model_param_spec(key: str | None) -> dict:
+    """三个模型参数在目录里的说明。`key=None` 表示「哪个都不用」。
+
+    单独抽出来是为了不给自回避行走抄第二份默认值 —— 它不吃键角、内旋转、
+    持久长度这三样（在格点上走，没有键角也没有持久长度），但它那一项照样得带
+    `default`：前端的 syncModelFields() 会拿这三个默认值做字符串替换
+    （把说明里的「键角固定为 109.47°」换成输入框里的当前值），缺了会抛。
+    """
+    return {
+        "theta_deg": {
+            "label": "键角 θ", "unit": "°", "default": DEFAULT_THETA_DEG,
+            "min": THETA_EPS_DEG, "max": 180.0 - THETA_EPS_DEG,
+            "used": key in (MODEL_FRC, MODEL_HINDERED),
+        },
+        "cos_phi": {
+            "label": "内旋转平均余弦", "unit": "", "default": DEFAULT_COS_PHI,
+            "min": COS_PHI_MIN, "max": COS_PHI_MAX,
+            "used": key == MODEL_HINDERED,
+        },
+        "p": {
+            "label": "持久长度", "unit": "链段长度", "default": DEFAULT_P,
+            "min": 0.01, "max": P_MAX,
+            "used": key == MODEL_WLC,
+        },
+    }
+
+
 def model_catalog() -> list[dict]:
-    """四个模型的目录：前端拿它建选择器、AI 助手拿它知道自己能算什么。
+    """链模型的目录：前端拿它建选择器，并据此决定**哪些卡片适用**。
 
     和 KUHN_PRESETS 一样，**唯一的一份在这里**：/api/models 原样吐出去，
     前端不再抄第二份（抄了就会改一处忘一处，两处各说各话）。
+
+    目录里有**两类**模型，用 `analytic` 这一个位区分：
+
+    · `analytic: True` —— 四个解析模型（fjc / frc / hindered / wlc），⟨h²⟩ 有闭式解。
+      力–伸长、h→n 反解、模型指纹、数值表、P(h) 分布、主结果全都成立；
+    · `analytic: False` —— 自回避行走。**没有闭式解**（不是「还没推出来」，
+      是它属于另一个普适类），只能实空间采样，上面那些「按公式算」的功能
+      一条都不适用。
+
+    前端就靠这一位把不适用的卡片收起来。别在各自的模块里再写一遍
+    `model === 'saw'` —— 那正是这份目录要消掉的东西。
     """
     out = []
     for key in MODEL_KEYS:
@@ -1229,27 +1594,625 @@ def model_catalog() -> list[dict]:
         out.append({
             "key": key,
             "label": MODEL_LABELS[key],
+            "analytic": True,
             "formula": model_formula(mp),
             "note": model_note(mp),
-            "params": {
-                "theta_deg": {
-                    "label": "键角 θ", "unit": "°", "default": DEFAULT_THETA_DEG,
-                    "min": THETA_EPS_DEG, "max": 180.0 - THETA_EPS_DEG,
-                    "used": key in (MODEL_FRC, MODEL_HINDERED),
-                },
-                "cos_phi": {
-                    "label": "内旋转平均余弦", "unit": "", "default": DEFAULT_COS_PHI,
-                    "min": COS_PHI_MIN, "max": COS_PHI_MAX,
-                    "used": key == MODEL_HINDERED,
-                },
-                "p": {
-                    "label": "持久长度", "unit": "链段长度", "default": DEFAULT_P,
-                    "min": 0.01, "max": P_MAX,
-                    "used": key == MODEL_WLC,
-                },
-            },
+            "params": _model_param_spec(key),
         })
+
+    # 自回避行走：**不在 MODEL_KEYS 里**（理由见下面「自回避行走」那一节的开头 ——
+    # 进了 MODEL_KEYS 就要给四个解析模型的公式层加一堆「本模型不适用」的分支），
+    # 但它是用户能选的一个模型，所以要出现在同一个选择器、同一份目录里。
+    out.append({
+        "key": "saw",
+        "label": "自回避行走（SAW）",
+        "analytic": False,
+        "formula": f"⟨R²⟩ ∝ n^(2ν)，ν = {SAW_NU:.7f}（3D 立方格）",
+        "note": (
+            "本模型没有闭式解 —— 这不是「还没推出来」，是它属于另一个普适类："
+            "⟨R²⟩ ∝ n^(2ν) 里的 ν 只能数值定出来。所以这一页只做实空间采样，"
+            f"在立方格点上严格拒绝采样（撞到自己就整条丢弃）。n ≤ {SAW_N_MAX} 是"
+            "**算力**上限不是物理上限：存活率每加一个链段约乘 0.78，"
+            "n = 30 比 n = 12 贵约 250 倍。"
+            "力–伸长、h→n 反解、模型指纹、数值表、末端距分布这些「按公式算」的功能"
+            "本模型一条都不适用，已经收起来了 —— 要看它们就切回上面四个解析模型。"
+        ),
+        "params": _model_param_spec(None),
+    })
     return out
+
+
+# --- 自回避行走（SAW）----------------------------------------------------
+#
+# 上面四个模型的 ⟨h²⟩ 都有闭式解，所以它们能共用同一套公式层。自回避行走
+# **没有** —— 「同一个格点不许重复访问」这条约束把它推进了另一个普适类，
+# 末端距只能测、不能推：
+#
+#     ⟨R²⟩ ∝ n^(2ν)，ν = 0.5875970（3D 立方格），2ν = 1.175194
+#
+# 所以它**不做成 MODEL_KEYS 的第五项**：一旦进去，force_extension / solve_n /
+# model_fingerprint / model_catalog / AI 工具全都得加「本模型无解析式，不适用」
+# 的分支，四个解析模型的公式层就被污染了。它单独成节、单独成卡，并自带一条
+# 理想链对照 —— 于是「扫描卡验证斜率是不是 1」在这里变成「实测 ν 是不是 0.588」。
+#
+# 格点约定：立方格，6 个单位方向，步长 = l = 格点常数。
+
+# 3D 立方格的普适指数。这不是「还没推出来的闭式解」，而是**不存在**闭式解 ——
+# 它由数值/共形自举定出来，是这一节唯一的理论锚点。
+SAW_NU = 0.5875970
+SAW_SCALE_REF = 2.0 * SAW_NU        # ⟨R²⟩ 的标度指数 2ν = 1.175194
+
+# 链段数上限。严格拒绝采样的存活率每加一步大约乘 0.79（渐近到 μ/6 = 0.7807），
+# 所以代价随 n **指数**增长：n=30 比 n=10 贵两个数量级。这是**算力**上限，
+# 不是物理上限。
+SAW_N_MAX = 30
+SAW_CHAINS_MAX = 20_000
+SAW_DEFAULT_CHAINS = 1_000
+
+# 试投预算。实测吞吐约 4×10⁶ 元素运算/秒，而每次试投平均约 16 个元素运算，
+# 所以 150 万次试投 ≈ 6 秒（整次扫描），单点 120 万 ≈ 5 秒 —— 前端在这期间
+# 显示忙状态。默认那组 n 加 1000 条链大致要 110 万次试投，正好在预算内。
+SAW_TRIALS_PER_N = 1_200_000
+SAW_TRIALS_TOTAL = 1_500_000
+# 分块的内存上限（只管 keys 那张表，walk 是它的 1/8）。按**内存**反算块大小，
+# 不按行数：M=2×10⁷ 行 × (n+1) 个 int64 键要 2~6 GB，这是踩过的坑。
+_SAW_MEM_BYTES = 64_000_000
+
+# 立方格的连接常数 μ（存活率渐近 ≈ (μ/6)^n）与指数修正 n^(11/32)，γ = 43/32 是
+# 3D 的「磁化率」指数。**这两个只用于估算批量与预算**，不作为结果、也不进任何
+# 报给用户的量 —— 页面上报的存活率一律是实测的 accept_rate。
+_SAW_MU = 4.68404
+_SAW_SUSCEPT_EXP = 11.0 / 32.0
+_SAW_AMP = 0.81927            # 由下面表里 n=8 的精确值定出
+
+# n ≤ 8 的**精确**一步自回避行走条数 c_n（立方格，OEIS A001412）。
+# 用途有二：估批量/预算时给出准确值；以及校验实测存活率是否等于 c_n/6^n ——
+# 这正是「采样器有没有退化成 Rosenbluth 采样」的判据（那个 bug 的现象就是存活率
+# 恒为 1）。测试用**现场 DFS 枚举**把这张表逐项钉住。
+#
+# 只到 8 是有意的：n=9、10 的枚举要一两千万次访问，测试跑不动，而收进来的
+# 未验证常量比少一点精度更糟。n ≥ 9 走渐近式（偏高约 4%），估批量够用。
+_SAW_C_N = {
+    0: 1, 1: 6, 2: 30, 3: 150, 4: 726, 5: 3534, 6: 16926, 7: 81390, 8: 387966,
+}
+
+# 位置都是 [-n, n] 内的小整数，用固定宽度打包成唯一整数键：成员判定就退化成
+# 一次整数相等比较，不用哈希、不会碰撞，比集合快一个量级。
+_SAW_OFF = SAW_N_MAX + 1
+_SAW_W = 2 * SAW_N_MAX + 3
+_SAW_ORIGIN = _SAW_OFF * (1 + _SAW_W + _SAW_W * _SAW_W)
+
+SAW_DIRECTIONS = np.array(
+    [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)],
+    dtype=np.int64,
+)
+
+
+@dataclass
+class SawChainResult:
+    """自回避行走的一次实现 + 同格点理想链的对照。
+
+    和 ChainResult 最大的不同：这里**没有解析式**可用。理想链那一侧的
+    R2_ideal = n·l² 仍然精确（与 FJC 恒等），但 SAW 这一侧只有实测值，
+    所以 rel_se 是**实测的** std/√M，而不是高斯公式 √(2/3)/√M —— SAW 的 R²
+    分布比高斯窄，套高斯公式会把误差报大。swelling = R2_mean/(n·l²)。
+    """
+
+    n: int
+    l: float
+    seed: int
+    chains: int              # 实际采到的链数（受试投上限约束，可能少于请求值）
+    trials: int              # 试投了多少条链
+    accept_rate: float       # 实测存活率 = chains/trials
+
+    points: np.ndarray       # (chains, n+1, 3) SAW 顶点，第 0 个是原点
+    R: np.ndarray            # (chains, 3) SAW 末端矢量
+    R_mag: np.ndarray        # (chains,) |R|
+
+    ideal_points: np.ndarray  # (chains, n+1, 3) 同 n 的理想链顶点
+    ideal_R2_mean: float      # 理想链的实测 ⟨R²⟩
+
+    R2_mean: float           # SAW 的实测 ⟨R²⟩
+    R2_ideal: float          # n·l²，理想链的解析 ⟨h²⟩（与 FJC 恒等）
+    R2_rel_se: float         # 实测相对标准误 std/(mean·√M)
+    swelling: float          # R2_mean / R2_ideal，> 1 就是溶胀
+
+    n_max: int = SAW_N_MAX       # 上限回显，前端据此提示而不是自己抄一份
+    chains_max: int = SAW_CHAINS_MAX
+    nu: float = SAW_NU
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """扁平化顶点数组并限位小数，和 ChainResult.to_dict() 同一套写法。"""
+        q = CHAIN_DECIMALS
+
+        def flat(pts):
+            return [[round(float(v), q) for v in row.ravel()] for row in pts]
+
+        return {
+            "n": self.n,
+            "l": self.l,
+            "seed": self.seed,
+            "chains": self.chains,
+            "trials": self.trials,
+            "accept_rate": self.accept_rate,
+            "R2_mean": self.R2_mean,
+            "R2_ideal": self.R2_ideal,
+            "R2_rel_se": self.R2_rel_se,
+            "ideal_R2_mean": self.ideal_R2_mean,
+            "swelling": self.swelling,
+            "R_mag": [round(float(v), q) for v in self.R_mag],
+            "R": [[round(float(v), q) for v in row] for row in self.R],
+            "points": flat(self.points),
+            "ideal_points": flat(self.ideal_points),
+            "n_max": self.n_max,
+            "chains_max": self.chains_max,
+            "nu": self.nu,
+            "warnings": self.warnings,
+        }
+
+
+@dataclass
+class SawSweepResult:
+    """SAW 的 ⟨R²⟩ 对 n 的标度关系，附带理想链（斜率 1）与 2ν 两条参考线。
+
+    和 SweepResult 的区别集中在「没有解析式」这一件事上：
+    - rel_se 是**每个 n 一个**的实测值（SAW 的 R² 相对涨落随 n 变），
+      所以 slope_se 用逐点误差传播，而不是「一个 rel_se 除以 √Sxx」。
+    - 参考线有**两条**：理想链斜率 1、文献值 2ν = 1.175194。
+    - 两条线都**锚在数据质心**上（不引任何无法自证的振幅）。
+    """
+
+    l: float
+    seed: int
+    chains: int               # 每个 n 请求的链数
+    ns: list[int]
+
+    R2_mean: list[float]      # 每个 n 的 SAW 实测 ⟨R²⟩
+    R2_ideal: list[float]     # 每个 n 的 n·l²
+    h_rms_sim: list[float]
+    h_rms_ideal: list[float]
+    swelling: list[float]     # R2_mean / R2_ideal
+    rel_se: list[float]       # 每个 n 实测的相对标准误
+    trials: list[int]         # 每个 n 试投了多少条链
+    chains_used: list[int]    # 每个 n 实际采到多少条链
+
+    slope: float | None       # log⟨R²⟩ 对 log n 的拟合斜率
+    intercept: float | None
+    fit_r2: float | None
+    slope_se: float | None    # 逐点误差传播，见 saw_sweep()
+    nu_eff: float | None      # slope/2，这片 n 区间的**有效** ν
+    slope_ref: float = SAW_SCALE_REF   # 文献值 2ν
+    intercept_ref: float | None = None  # 斜率 2ν、过质心的参考线
+    intercept_ideal: float | None = None  # 斜率 1、过质心的参考线
+
+    n_max: int = SAW_N_MAX
+    chains_max: int = SAW_CHAINS_MAX
+    nu: float = SAW_NU
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        def opt(v):
+            return None if v is None else float(v)
+
+        return {
+            "l": self.l,
+            "seed": self.seed,
+            "chains": self.chains,
+            "n": list(self.ns),
+            "R2_mean": [float(v) for v in self.R2_mean],
+            "R2_ideal": [float(v) for v in self.R2_ideal],
+            "h_rms_sim": [float(v) for v in self.h_rms_sim],
+            "h_rms_ideal": [float(v) for v in self.h_rms_ideal],
+            "swelling": [float(v) for v in self.swelling],
+            "rel_se": [float(v) for v in self.rel_se],
+            "trials": [int(v) for v in self.trials],
+            "chains_used": [int(v) for v in self.chains_used],
+            "slope": opt(self.slope),
+            "intercept": opt(self.intercept),
+            "fit_r2": opt(self.fit_r2),
+            "slope_se": opt(self.slope_se),
+            "nu_eff": opt(self.nu_eff),
+            "slope_ref": float(self.slope_ref),
+            "intercept_ref": opt(self.intercept_ref),
+            "intercept_ideal": opt(self.intercept_ideal),
+            "nu": self.nu,
+            "n_max": self.n_max,
+            "chains_max": self.chains_max,
+            "warnings": self.warnings,
+        }
+
+
+def _saw_survival(n: int) -> float:
+    """存活率 c_n/6^n 的**估算值**。只用于批量与预算，不进结果。
+
+    n ≤ 10 用精确表；再大用渐近式 A·(μ/6)^n·n^(11/32) —— 单用 (μ/6)^n 在有限 n
+    偏得很厉害（n=8 时给 0.138，实际 0.231，差 1.7 倍），因为还差一个 n^(11/32)
+    的修正和一个振幅。加上之后 n=11…30 的误差在 10% 出头，估批量足够。
+
+    **这不是物理**：真值只有数值/枚举能给，页面上报的存活率一律是实测值。
+    """
+    if n in _SAW_C_N:
+        return _SAW_C_N[n] / 6.0 ** n
+    return _SAW_AMP * (_SAW_MU / 6.0) ** n * n ** _SAW_SUSCEPT_EXP
+
+
+def _saw_next_batch_size(n: int, remaining: int, trials_left: int) -> int:
+    """下一批投多少条：按存活率估算「还差多少试投」，再由内存和预算封顶。
+
+    按内存上限整批投是不行的：n=10 时一批 72 万次试投会活下来十万条，而只要
+    一千条 —— 一个点白烧 1.7 秒（这是实测到的）。估算偏了也不要紧，下一轮会
+    拿**实测**存活率重新估，自己收敛。
+    """
+    est = _saw_survival(n)
+    need = math.ceil(remaining / est) if est > 0 else trials_left
+    batch_max = max(1, _SAW_MEM_BYTES // (8 * (n + 1)))
+    return int(max(1, min(batch_max, trials_left, need)))
+
+
+def _saw_endpoints(rng, n: int, want: int, trial_max: int):
+    """采 want 条自回避行走，只要末端矢量（格点坐标）。
+
+    返回 (R, trials, produced)。`produced` 是**试投中活下来的总条数**，于是
+    produced/trials 才是实测存活率 —— 必须按「活下来多少」统计，不能按
+    「返回了多少条」：最后一批会随手截断，那个比值会假得离谱（第一版就报出
+    0.0014 这种数，而真值 0.146）。
+
+    试投上限兜住时会**少给几条**，由调用方转成一条 warning ——「算力不够」
+    不是「参数非法」，不该报错。
+    """
+    chunks, produced, trials = [], 0, 0
+    while produced < want and trials < trial_max:
+        m = _saw_next_batch_size(n, want - produced, trial_max - trials)
+        pos, _ = _saw_batch(rng, n, m)
+        trials += m
+        produced += pos.shape[0]
+        if pos.shape[0]:
+            chunks.append(pos)
+    R = (np.concatenate(chunks) if chunks
+         else np.zeros((0, 3), dtype=np.int64))
+    # 截断是无偏的：同一批里的存活链彼此可交换，取前 want 条即可。
+    return R[:want], trials, produced
+
+
+def _saw_key(xyz: np.ndarray) -> np.ndarray:
+    """(k, 3) 的格点坐标 → (k,) 的唯一整数键。
+
+    宽度 _SAW_W = 2·SAW_N_MAX+3 保证 ±n 内的坐标打包后互不重叠，所以键相等
+    ⇔ 格点相同，成员判定可以当成纯整数比较来做。
+    """
+    return (xyz[:, 0] + _SAW_OFF
+            + (xyz[:, 1] + _SAW_OFF) * _SAW_W
+            + (xyz[:, 2] + _SAW_OFF) * _SAW_W * _SAW_W)
+
+
+def _saw_batch(rng, n: int, m: int, keep_paths: bool = False):
+    """一次试投 m 条链，返回 (存活的末端坐标 (k,3), 存活者走出的方向序列)。
+
+    每一步在**全部 6 个方向**里均匀选一个；撞到已访问的格点就整条链作废。
+    这个「撞上就丢」是严格均匀的关键 —— 若改成只在**空闲**邻居里均匀选
+    （Rosenbluth 采样），链几乎不会死（要 6 个邻居全被占才死），但每条构象的
+    权重不同、于是**有偏**，存活率也不再等于精确的 c_n/6^n。第一版就栽在这里，
+    现象是每个 n 的存活率都是 1.00000。
+
+    方向序列只在 keep_paths 时要（顶点由它累加出来，int8 比直接存 (m,n+1,3)
+    的坐标省 24 倍内存，而内存正是这里分块的依据）。逐步剔除已死的链是为了
+    **提前剪枝**：成员判定的代价是 O(k)，只给活着的链做，总量才是 Σ_k k·存活率
+    ≈ 16.1·试投数，而不是 n·试投数。
+    """
+    pos = np.zeros((m, 3), dtype=np.int64)
+    keys = np.empty((m, n + 1), dtype=np.int64)
+    keys[:, 0] = _SAW_ORIGIN          # 原点必须占位，否则第一步就能走回来
+    walk = np.empty((m, n), dtype=np.int8) if keep_paths else None
+    live = np.ones(m, dtype=bool)
+
+    for k in range(1, n + 1):
+        rows = np.flatnonzero(live)
+        if rows.size == 0:
+            break
+        sel = rng.integers(0, len(SAW_DIRECTIONS), size=rows.size)
+        cand = pos[rows] + SAW_DIRECTIONS[sel]
+        ck = _saw_key(cand)
+        hit = (keys[rows, :k] == ck[:, None]).any(axis=1)
+        good = rows[~hit]
+        live[rows[hit]] = False
+        if good.size == 0:
+            continue
+        if walk is not None:
+            walk[good, k - 1] = sel[~hit]
+        keys[good, k] = ck[~hit]
+        pos[good] = cand[~hit]
+
+    return pos[live], (walk[live] if walk is not None else None)
+
+
+def _walk_to_points(walk: np.ndarray, l: float) -> np.ndarray:
+    """方向下标序列 (k, n) → 顶点坐标 (k, n+1, 3)，首点是原点。"""
+    steps = SAW_DIRECTIONS[walk.astype(np.int64)]      # (k, n, 3)
+    pts = np.concatenate(
+        [np.zeros((walk.shape[0], 1, 3), dtype=np.int64), np.cumsum(steps, axis=1)],
+        axis=1,
+    )
+    return pts.astype(float) * l
+
+
+def validate_saw(n, l, seed=None, chains=1,
+                 max_chains: int | None = SAW_CHAINS_MAX,
+                 max_n: int | None = SAW_N_MAX):
+    """SAW 的输入校验：先过通用的 validate()，再卡两条**算力**上限。
+
+    上限的理由和别的 validate_* 不一样，所以错误信息必须把它说清楚 ——
+    这里既不是「画不下」也不是「物理上没意义」，而是严格拒绝采样太贵。
+    """
+    n_i, l_f = validate(n, l)
+    if max_n is not None and n_i > max_n:
+        raise FJCInputError(
+            f"自回避行走的链段数不能超过 {max_n}：严格拒绝采样的存活率按 "
+            f"(μ/6)^n ≈ 0.78^n 衰减，n={max_n} 比 n=10 贵约 250 倍。"
+            f"这是算力上限，不是物理上限。"
+        )
+    chains_i = _as_int(chains, "链数")
+    if chains_i < 1:
+        raise FJCInputError("链数至少为 1")
+    if max_chains is not None and chains_i > max_chains:
+        raise FJCInputError(f"自回避行走最多采 {max_chains:,} 条链，收到 {chains_i:,}")
+    return n_i, l_f, _as_seed(seed), chains_i
+
+
+def saw_chain(n, l=1.0, seed=None, chains=1,
+              max_chains: int | None = SAW_CHAINS_MAX,
+              max_n: int | None = SAW_N_MAX,
+              trial_max: int | None = SAW_TRIALS_PER_N) -> SawChainResult:
+    """采 `chains` 条 n 步自回避行走，并给出同 n、同格点的理想链做对照。
+
+    SAW 那一侧的顶点用严格拒绝采样（见 _saw_batch）；理想链那一侧是同一格点上
+    「每步 6 选 1、不管走没走过」的普通随机行走，⟨R²⟩ = n·l² 精确成立（与 FJC
+    恒等）。两者画在一起时，**唯一的差别就是那条排除约束**，这正是这张卡要讲的。
+
+    实测 ⟨R²⟩ 应当**大于** n·l²（溶胀），比值就是 swelling。n=4 时约 1.39，
+    n=12 时约 1.75 —— 短链端离渐近值还很远。
+
+    三个上限都只影响「能跑多大」，传 None 即解除 —— 和 validate_chain() 一样，
+    是为了让统计验证能开更大的样本。
+    """
+    n, l, seed, chains = validate_saw(
+        n, l, seed, chains, max_chains=max_chains, max_n=max_n
+    )
+    if trial_max is None:
+        trial_max = SAW_TRIALS_PER_N
+
+    # SAW 与理想链用各自独立的子种子：既能整体复现，两条链也不共享随机流。
+    ss = np.random.SeedSequence(seed)
+    child_saw, child_ideal = ss.spawn(2)
+    rng = np.random.default_rng(child_saw)
+
+    want = chains
+    got, trials = 0, 0
+    paths, endpoints = [], []
+    while got < want and trials < trial_max:
+        m = _saw_next_batch_size(n, want - got, trial_max - trials)
+        pos, walk = _saw_batch(rng, n, m, keep_paths=True)
+        trials += m
+        if pos.shape[0]:
+            paths.append(walk)
+            endpoints.append(pos)
+            got += pos.shape[0]
+
+    # 三条路都对齐到同一个链数，否则 points 和 R 的第一维对不上。
+    k = min(want, got)
+    if k <= 0:
+        raise FJCInputError(
+            f"n={n} 时试投 {trials:,} 条链一条都没活下来，请减小 n 或提高试投预算"
+        )
+    points = _walk_to_points(np.concatenate(paths)[:k], l)
+    R = np.concatenate(endpoints)[:k].astype(float) * l
+
+    ideal = _walk_to_points(
+        np.random.default_rng(child_ideal).integers(
+            0, len(SAW_DIRECTIONS), size=(k, n)
+        ).astype(np.int8),
+        l,
+    )
+
+    R_mag = np.linalg.norm(R, axis=1)
+    R2_mean = float(np.mean(R_mag ** 2))
+    ideal_R2_mean = float(np.mean(np.sum(ideal[:, -1, :] ** 2, axis=1)))
+    R2_ideal = n * l * l
+    # 实测的相对标准误：std(R²)/(⟨R²⟩·√M)。不用高斯的 √(2/3)/√M ——
+    # SAW 的 R² 分布比高斯窄（实测 std(R²)/⟨R²⟩ ≈ 0.50~0.63 对 0.816），
+    # 而且这个比值随 n 变，套高斯公式会把误差报大。
+    rel_se = (float(np.std(R_mag ** 2, ddof=1)) / R2_mean / math.sqrt(k)
+              if k > 1 and R2_mean > 0 else 0.0)
+    # 存活率按**活下来的总条数**算，不是按返回的条数 —— 最后一批会截断。
+    accept_rate = got / trials if trials else 0.0
+
+    warnings: list[str] = []
+    if k < want:
+        warnings.append(
+            f"试投上限 {trial_max:,} 兜住了：请求 {want:,} 条，只采到 {k:,} 条"
+            f"（n={n} 的实测存活率 {accept_rate * 100:.3f}%）。要更多样本请减小 n。"
+        )
+    # 存活率对不对得上精确的 c_n/6^n，是「采样器有没有退化成 Rosenbluth 采样」
+    # 的判据 —— 那个 bug 的现象是存活率恒等于 1。只在 _SAW_C_N 覆盖到的 n 上比，
+    # 因为那里有**精确**的 c_n；更大的 n 只有渐近估计（差 10% 出头），
+    # 撑不起这么紧的判据。
+    if n in _SAW_C_N and trials >= 20_000:
+        exact = _saw_survival(n)
+        if abs(accept_rate - exact) / exact > 0.10:
+            warnings.append(
+                f"实测存活率 {accept_rate:.5f} 与精确的 c_n/6^n = {exact:.5f} "
+                f"对不上（差 {abs(accept_rate - exact) / exact * 100:.0f}%），"
+                f"这不正常 —— 请把参数发回来看看。"
+            )
+    if n < 5:
+        warnings.append(
+            f"n={n} 太短，⟨R²⟩ 还看不出标度行为；自回避的普适指数要到 n 几十以上才显现。"
+        )
+
+    return SawChainResult(
+        n=n, l=l, seed=seed, chains=k, trials=trials, accept_rate=accept_rate,
+        points=points, R=R, R_mag=R_mag,
+        ideal_points=ideal, ideal_R2_mean=ideal_R2_mean,
+        R2_mean=R2_mean, R2_ideal=R2_ideal, R2_rel_se=rel_se,
+        swelling=R2_mean / R2_ideal,
+        warnings=warnings,
+    )
+
+
+def saw_sweep(ns, l=1.0, seed=None, chains=SAW_DEFAULT_CHAINS,
+              max_points: int | None = SWEEP_N_MAX,
+              max_chains: int | None = SAW_CHAINS_MAX,
+              trials_per_n: int | None = SAW_TRIALS_PER_N,
+              trials_total: int | None = SAW_TRIALS_TOTAL) -> SawSweepResult:
+    """扫一组 n，每个 n 采 `chains` 条自回避行走，拟合 ⟨R²⟩ ∝ n^(2ν)。
+
+    这是把「自回避行走」从一句话变成一次**可验证的测量**：对 log⟨R²⟩ 与 log n
+    做最小二乘拟合，再和 2ν = 1.175194 比。
+
+    **要如实预期**：n ≤ 30 这片区间测出来的斜率约 1.20~1.22，**高于** 2ν ——
+    有限尺寸修正的符号在这里是正的，渐近值要 n 很大才到。所以这里报的是
+    「这片 n 区间的**有效** ν = slope/2」，不是「测出了 0.588」。
+
+    slope_se 用逐点误差传播（每个 n 的实测 rel_se 不同），当各点误差相同时
+    退化成 SweepResult 里那条 rel_se/√Sxx。
+    """
+    n_list, l = _as_n_list(ns), 1.0
+    # 逐项校验（沿用 validate_saw 的中文信息），再单独看链数与预算
+    checked = []
+    for raw in n_list:
+        n_i, l = validate(raw, l)
+        checked.append(n_i)
+    if not checked:
+        raise FJCInputError("请至少输入一个链段数 n")
+    if max_points is not None and len(checked) > max_points:
+        raise FJCInputError(f"一次最多扫 {max_points} 个 n，收到 {len(checked)} 个")
+    if len(set(checked)) != len(checked):
+        raise FJCInputError("链段数 n 有重复，请去掉重复值")
+    for n_i in checked:
+        if n_i > SAW_N_MAX:
+            raise FJCInputError(
+                f"自回避行走的链段数不能超过 {SAW_N_MAX}（收到 {n_i}）："
+                f"每加一个链段，存活率大约乘 0.78，代价是指数增长的，"
+                f"再大就跑不完。这是算力上限，不是物理上限。"
+            )
+    ns = checked
+
+    chains_i = _as_int(chains, "每个 n 的链数")
+    if chains_i < 1:
+        raise FJCInputError("每个 n 的链数至少为 1")
+    if max_chains is not None and chains_i > max_chains:
+        raise FJCInputError(
+            f"自回避行走每个 n 最多采 {max_chains:,} 条链，收到 {chains_i:,}"
+        )
+    seed = _as_seed(seed)
+
+    # 预算：每个 n 要 trials ≈ chains / 存活率，封顶在 trials_per_n。
+    # 提前拦比跑到一半才失败好，但**这个估计只用来拦**：真正花掉多少次试投由
+    # 采样器实测，结果里的 trials 是实测值，不是这里的估算。
+    cap = trials_per_n if trials_per_n is not None else SAW_TRIALS_PER_N
+    est_total = sum(min(cap, math.ceil(chains_i / _saw_survival(n_i)))
+                    for n_i in ns)
+    if trials_total is not None and est_total > trials_total:
+        raise FJCInputError(
+            f"计算量超出预算（估算需试投 {est_total:,} 次 > {trials_total:,}），"
+            f"请降低链数或减少大 n 的个数"
+        )
+
+    children = np.random.SeedSequence(seed).spawn(len(ns))
+    R2_mean, R2_ideal, rel_se, trials_used, chains_used, accept = [], [], [], [], [], []
+    for n_i, child in zip(ns, children):
+        R, t, produced = _saw_endpoints(
+            np.random.default_rng(child), n_i, chains_i, cap
+        )
+        m = R.shape[0]
+        if m == 0:
+            raise FJCInputError(
+                f"n={n_i} 时试投 {t:,} 条链一条都没活下来，请减小 n 或提高预算"
+            )
+        r2s = np.sum(R.astype(float) ** 2, axis=1) * l * l
+        r2 = float(np.mean(r2s))
+        R2_mean.append(r2)
+        R2_ideal.append(n_i * l * l)
+        trials_used.append(int(t))
+        chains_used.append(int(m))
+        accept.append(produced / t if t else 0.0)
+        # 实测 R² 的相对标准误（ddof=1），逐点不同 —— 这是和 SweepResult 的关键差异
+        rel_se.append(float(np.std(r2s, ddof=1) / r2 / math.sqrt(m)) if m > 1 else 0.0)
+
+    slope = intercept = fit_r2 = slope_se = nu_eff = None
+    intercept_ref = intercept_ideal = None
+    if len(ns) >= 2:
+        ln_n = np.log(np.asarray(ns, dtype=float))
+        ln_y = np.log(np.asarray(R2_mean, dtype=float))
+        slope_f, intercept_f = np.polyfit(ln_n, ln_y, 1)
+        slope, intercept = float(slope_f), float(intercept_f)
+        ss_res = float(np.sum((ln_y - (slope * ln_n + intercept)) ** 2))
+        ss_tot = float(np.sum((ln_y - ln_y.mean()) ** 2))
+        fit_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+        # 逐点误差传播：Var(slope) = Σ(xᵢ−x̄)²σᵢ² / Sxx²。各点 σᵢ 相同时
+        # 正是 SweepResult 用的 σ/√Sxx。
+        xbar = float(ln_n.mean())
+        sxx = float(np.sum((ln_n - xbar) ** 2))
+        if sxx > 0:
+            num = float(np.sum(((ln_n - xbar) ** 2) * np.asarray(rel_se) ** 2))
+            slope_se = math.sqrt(num) / sxx
+            nu_eff = slope / 2.0
+        # 两条参考线都过**数据质心**，只有斜率是外部信息 —— 不引振幅。
+        ybar = float(ln_y.mean())
+        intercept_ideal = ybar - 1.0 * xbar
+        intercept_ref = ybar - SAW_SCALE_REF * xbar
+
+    warnings: list[str] = []
+    if len(ns) < 2:
+        warnings.append("只给了一个 n，拟合不出标度斜率；至少要两个不同的 n。")
+    elif len(ns) == 2:
+        warnings.append(
+            "只有两个 n：任何两点都能连成一条直线，决定系数 R² 必然是 1，说明不了什么。"
+        )
+    short = [n_i for n_i, c in zip(ns, chains_used) if c < chains_i]
+    if short:
+        warnings.append(
+            "这些 n 没采满请求的链数（试投上限兜住）："
+            + "、".join(f"n={n_i}" for n_i in short)
+            + f"。它们的点会明显地跳，判断斜率时请把这一条算进去。"
+        )
+    if any(n_i < 10 for n_i in ns):
+        warnings.append(
+            "有 n < 10 的扫描点：那里离渐近区还很远，会把拟合斜率推高。"
+            "自回避行走的 2ν = 1.175194 是 n → ∞ 的极限。"
+        )
+    # 阈值对着 slope_ref 而不是 1.0：这条说的是「比 2ν 高得太多」，
+    # 拿 1.0 当基准的话，斜率落在 1 和 2ν 之间（不可能由采样误差产生）
+    # 也会被判成「高于 2ν」，那条消息就成了假话。
+    #
+    # 而且**只在全是 n ≥ 10 时才判**：带了小 n 的点时，有限尺寸修正本来就会把
+    # 斜率推高 —— 默认那组（含 5、8）实测稳定落在 2ν 之上 1.5~5σ，是**正常**
+    # 结果。那样的话这条既不是异常信号、又和上一条说同一件事，默认参数一跑就
+    # 弹两条黄条、其中一条还说「高 3.9 倍标准误」，读起来像出了问题。
+    # 小 n 的解释交给上一条；这条留给「全是 n ≥ 10、斜率却仍然高得离谱」——
+    # 实测这种情况下 10 个种子最大也只到 1.8σ，真越过 3σ 就值得看一眼。
+    if (slope is not None and slope_se is not None
+            and all(n_i >= 10 for n_i in ns)
+            and slope > SAW_SCALE_REF + 3.0 * slope_se):
+        # 这里**不是**异常告警：偏高是有限尺寸修正的正常表现，要说清方向。
+        warnings.append(
+            f"拟合斜率 {slope:.4f}（有效 ν = {nu_eff:.4f}）比 2ν = "
+            f"{SAW_SCALE_REF:.4f} 高 {(slope - SAW_SCALE_REF) / slope_se:.1f} 倍标准误。"
+            f"这片 n 区间偏高的有限尺寸修正是预期之内的，不是采样出错 —— "
+            f"渐近值要到 n 很大才显现，而 n > {SAW_N_MAX} 跑不完。"
+        )
+
+    return SawSweepResult(
+        l=l, seed=seed, chains=chains_i, ns=ns,
+        R2_mean=R2_mean, R2_ideal=R2_ideal,
+        h_rms_sim=[math.sqrt(v) for v in R2_mean],
+        h_rms_ideal=[math.sqrt(v) for v in R2_ideal],
+        swelling=[a / b for a, b in zip(R2_mean, R2_ideal)],
+        rel_se=rel_se, trials=trials_used, chains_used=chains_used,
+        slope=slope, intercept=intercept, fit_r2=fit_r2, slope_se=slope_se,
+        nu_eff=nu_eff, intercept_ref=intercept_ref, intercept_ideal=intercept_ideal,
+        warnings=warnings,
+    )
 
 
 # --- 力–伸长（Langevin）-------------------------------------------------

@@ -679,6 +679,302 @@ class TestSweep(unittest.TestCase):
         self.assertLess(d["slope_se"], d["rel_se"])
 
 
+class TestSaw(unittest.TestCase):
+    """自回避行走：严格拒绝采样的正确性 + ⟨R²⟩ ∝ n^(2ν) 的实测。
+
+    这里和别的类有一个根本区别：SAW **没有解析式**可以对照。所以「算得对不对」
+    只能换一个独立来源来验 —— 用**现场 DFS 枚举**数出精确的 c_n，再看采样器的
+    存活率是不是 c_n/6^n。这比断言某个硬编码常数强得多：把采样器改坏成
+    Rosenbluth（只在空闲邻居里选）时存活率会变成 ~1，这条测试立刻炸。
+    """
+
+    # 现场 DFS 的 n 上限。n=8 要访问约 49 万个格点，不到一秒；n=9 就上千万了。
+    DFS_N_MAX = 8
+
+    def _exact_cn(self, n):
+        """DFS 枚举 n 步自回避行走的条数。独立于内核里那张表。"""
+        if not hasattr(self, "_cn_cache"):
+            self._cn_cache = {}
+        if n in self._cn_cache:
+            return self._cn_cache[n]
+        dirs = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+        total = 0
+
+        def walk(x, y, z, visited, steps):
+            nonlocal total
+            if steps == n:
+                total += 1
+                return
+            for dx, dy, dz in dirs:
+                nxt = (x + dx, y + dy, z + dz)
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                walk(nxt[0], nxt[1], nxt[2], visited, steps + 1)
+                visited.discard(nxt)
+
+        walk(0, 0, 0, {(0, 0, 0)}, 0)
+        self._cn_cache[n] = total
+        return total
+
+    def test_exact_cn_table_matches_enumeration(self):
+        """内核里那张精确表必须**逐项**等于现场枚举的结果。
+
+        这张表是估批量和判断「采样器坏了没」的依据，它自己得先被钉死。
+        """
+        for n in range(1, self.DFS_N_MAX + 1):
+            self.assertEqual(
+                fjc._SAW_C_N[n], self._exact_cn(n),
+                msg=f"n={n} 的表值 {fjc._SAW_C_N[n]} 与枚举 {self._exact_cn(n)} 不符",
+            )
+
+    def test_survival_equals_exact_cn_over_6_to_the_n(self):
+        """采样器的**实测存活率**必须等于精确的 c_n/6^n。
+
+        严格均匀的要害就在这里：每一步在全部 6 个方向里均匀选、撞上就丢，
+        存活率才是「活下来的行走数 / 6^n」。若改成在空闲邻居里均匀选
+        （Rosenbluth），存活率会趋近 1 而不再是 c_n/6^n —— 那是有偏采样。
+        """
+        trials = 150_000
+        for n in (4, 8):
+            exact = self._exact_cn(n) / 6.0 ** n
+            _, t, produced = fjc._saw_endpoints(
+                np.random.default_rng(4242 + n), n, 10 ** 9, trials
+            )
+            self.assertEqual(t, trials)
+            got = produced / t
+            se = math.sqrt(exact * (1 - exact) / t)
+            self.assertLess(abs(got - exact), 4 * se,
+                            msg=f"n={n} 存活率 {got:.5f} vs 精确 {exact:.5f}")
+
+    def test_accept_rate_counts_survivors_not_returned_chains(self):
+        """accept_rate 必须是「活下来多少 / 试投多少」，不是「返回多少 / 试投多少」。
+
+        这两者只在最后一批被截断时不同，而恰恰是那里最容易写错：按返回条数算
+        会报出 0.0014 这种数（真值 0.146），看着像采样器坏了。
+        """
+        n = 4
+        exact = self._exact_cn(n) / 6.0 ** n
+        r = fjc.saw_chain(n, seed=9, chains=300)
+        self.assertEqual(r.chains, 300)
+        self.assertGreater(r.trials, 300)          # 一定试投得比要的多
+        se = math.sqrt(exact * (1 - exact) / r.trials)
+        self.assertLess(abs(r.accept_rate - exact), 4 * se,
+                        msg=f"accept_rate={r.accept_rate:.5f} vs 精确 {exact:.5f}")
+
+    def test_batch_sizing_does_not_overshoot_wildly(self):
+        """试投次数要贴着「需要多少投多少」，不能按内存上限整批投。
+
+        按内存上限投的话 n=8 一批就是 16 万次试投（活下来几万条）而只要 500 条，
+        白烧掉大量算力。这里用「试投次数 / (链数/存活率)」这个纯比值来卡，
+        不用计时 —— 计时在不同机器上会飘。
+        """
+        n, want = 8, 500
+        exact = self._exact_cn(n) / 6.0 ** n
+        _, t, _ = fjc._saw_endpoints(np.random.default_rng(1), n, want, 10 ** 9)
+        ideal = want / exact
+        self.assertLess(t / ideal, 2.0, msg=f"试投 {t} 次，理想约 {ideal:.0f} 次")
+        self.assertGreater(t / ideal, 0.3)
+
+    def test_every_chain_is_self_avoiding(self):
+        """每条链都不能重复访问同一个格点 —— 这是模型的定义。"""
+        r = fjc.saw_chain(12, 1.0, seed=77, chains=60)
+        for i, chain in enumerate(r.points):
+            sites = {(round(x), round(y), round(z)) for x, y, z in chain}
+            self.assertEqual(len(sites), chain.shape[0],
+                             msg=f"第 {i} 条链有重复格点")
+
+    def test_steps_are_unit_lattice_vectors_of_length_l(self):
+        """每一步都必须是 ±l 的轴向步：步长恒为 l，且落在格点上。"""
+        l = 2.5
+        r = fjc.saw_chain(9, l, seed=31, chains=20)
+        steps = np.diff(r.points, axis=1)
+        # 每步只有一个分量非零，且绝对值等于 l
+        self.assertTrue(np.all(np.sum(np.abs(steps) > 0, axis=2) == 1))
+        np.testing.assert_allclose(np.linalg.norm(steps, axis=2), l, atol=1e-12)
+        # 顶点是 l 的整数倍（格点）
+        np.testing.assert_allclose(r.points / l, np.round(r.points / l), atol=1e-9)
+        # 首点是原点
+        np.testing.assert_allclose(r.points[:, 0, :], 0.0, atol=1e-12)
+
+    def test_shapes_agree_between_saw_and_ideal(self):
+        """SAW 与理想链必须同 n 同链数，否则并排画出来不是一个尺度的对照。"""
+        r = fjc.saw_chain(7, 1.0, seed=5, chains=12)
+        self.assertEqual(r.points.shape, (12, 8, 3))
+        self.assertEqual(r.ideal_points.shape, (12, 8, 3))
+        self.assertEqual(r.R.shape, (12, 3))
+        self.assertEqual(r.R_mag.shape, (12,))
+
+    def test_ideal_chain_on_the_lattice_recovers_nl2(self):
+        """同格点的理想链（每步 6 选 1，不管走没走过）⟨R²⟩ = n·l² 精确成立。
+
+        这是 SAW 卡片的对照基线：两者唯一的差别就是那条排除约束。理想链这一侧
+        必须落在自己 √(2/3)/√M 的涨落里 —— 高斯链这里用得上，因为理想链**就是**
+        高斯链。
+        """
+        n, M, l = 20, 3000, 1.0
+        r = fjc.saw_chain(n, l, seed=101, chains=M)
+        se = math.sqrt(2.0 / 3.0) / math.sqrt(M)
+        self.assertAlmostEqual(r.ideal_R2_mean / (n * l * l), 1.0,
+                               delta=4 * se, msg=f"理想链 ⟨R²⟩/{n}l²")
+
+    def test_swelling_is_the_whole_point(self):
+        """SAW 的 ⟨R²⟩ 必须明显**大于** n·l²，且随 n 单调变强。
+
+        这就是排除体积效应：链越舒展，⟨R²⟩ 相对理想链越大。实测 n=5 时约 1.45，
+        n=30 时约 2.06 —— 若装成第五个解析模型、⟨h²⟩ = n·l²·Cn，这一条根本不会出现。
+        """
+        small = fjc.saw_chain(5, 1.0, seed=11, chains=800)
+        big = fjc.saw_chain(30, 1.0, seed=11, chains=800)
+        self.assertGreater(small.swelling, 1.3)
+        self.assertGreater(big.swelling, small.swelling)
+        self.assertGreater(big.swelling, 1.7)
+        for r in (small, big):
+            self.assertAlmostEqual(r.swelling, r.R2_mean / (r.n * r.l ** 2), places=12)
+
+    def test_measured_rel_se_beats_the_gaussian_formula(self):
+        """SAW 的 rel_se 是实测的，而且**小于**高斯的 √(2/3)/√M。
+
+        sweep() 是无顶点的，只能用高斯公式 √(2/3)/√M；SAW 手上就有每条链的 R²，
+        所以用实测 std/√M 更准。实测 std(R²)/⟨R²⟩ ≈ 0.5~0.63 对高斯的 0.816，
+        套高斯公式会把误差报大约 40% —— 这不是笔误，是刻意的分歧。
+        """
+        M = 2000
+        r = fjc.saw_chain(12, 1.0, seed=13, chains=M)
+        gaussian = math.sqrt(2.0 / 3.0) / math.sqrt(M)
+        self.assertLess(r.R2_rel_se, gaussian)
+        r2 = r.R_mag ** 2
+        self.assertAlmostEqual(
+            r.R2_rel_se, float(np.std(r2, ddof=1)) / r.R2_mean / math.sqrt(M),
+            places=12,
+        )
+
+    def test_reproducible(self):
+        a = fjc.saw_chain(8, 1.0, seed=2026, chains=40)
+        b = fjc.saw_chain(8, 1.0, seed=2026, chains=40)
+        np.testing.assert_array_equal(a.points, b.points)
+        np.testing.assert_array_equal(a.ideal_points, b.ideal_points)
+        self.assertEqual(a.trials, b.trials)
+        # 换种子就该不一样（否则种子根本没接进去）
+        c = fjc.saw_chain(8, 1.0, seed=2027, chains=40)
+        self.assertFalse(np.array_equal(a.points, c.points))
+
+    def test_sweep_slope_is_above_one(self):
+        """拟合斜率必须显著 > 1 —— 这是「⟨R²⟩ 不再 ∝ n」的直接检验。
+
+        1 是理想链的斜率。SAW 的斜率实测约 1.19，落在 2ν = 1.1752 附近而不是 1
+        附近。seed 写死以保证确定性，不然会偶发失败。
+        """
+        r = fjc.saw_sweep([4, 8, 12, 16, 20], 1.0, seed=2026, chains=300)
+        self.assertGreater(r.slope, 1.0 + 3 * r.slope_se,
+                           msg=f"斜率 {r.slope} ± {r.slope_se}，没有显著大于 1")
+        self.assertGreater(r.fit_r2, 0.99)
+
+    def test_sweep_reference_is_2nu_and_reported(self):
+        """参考斜率是 2ν = 1.175194，有效 ν = 斜率/2，且要如实高于 2ν。
+
+        这一条把「不许承诺 1.176」写进测试：n ≤ 30 的有限尺寸修正把斜率**推高**，
+        截面报的必须是实测的有效 ν，而不是拿 2ν 去凑。
+        """
+        r = fjc.saw_sweep([5, 8, 12, 16, 20, 25, 30], 1.0, seed=1, chains=400)
+        self.assertAlmostEqual(r.slope_ref, 2 * fjc.SAW_NU, places=12)
+        self.assertAlmostEqual(r.nu_eff, r.slope / 2, places=12)
+        self.assertGreater(r.slope, r.slope_ref,
+                           msg="这片 n 区间实测就该高于 2ν，否则是采样出了问题")
+        # 但也不能高得离谱（高于 2ν 三倍标准误以上才算异常）
+        self.assertLess(r.slope - r.slope_ref, 5 * r.slope_se)
+
+    def test_sweep_reference_lines_pass_through_the_centroid(self):
+        """两条参考线只有斜率是外部信息，都锚在数据质心上（不引振幅）。
+
+        所以它们在 ln n = mean(ln n) 处必须同时穿过 mean(ln⟨R²⟩)。
+        """
+        r = fjc.saw_sweep([5, 10, 20, 30], 1.0, seed=8, chains=300)
+        xbar = float(np.mean(np.log(r.ns)))
+        ybar = float(np.mean(np.log(r.R2_mean)))
+        self.assertAlmostEqual(r.intercept_ideal + 1.0 * xbar, ybar, places=10)
+        self.assertAlmostEqual(r.intercept_ref + r.slope_ref * xbar, ybar, places=10)
+
+    def test_sweep_slope_se_generalises_the_sweep_formula(self):
+        """各点误差相同时，逐点传播必须退化成 σ/√Sxx（就是 sweep() 那条）。"""
+        r = fjc.saw_sweep([4, 8, 16, 30], 1.0, seed=3, chains=200,
+                          max_points=None)
+        ln_n = np.log(np.asarray(r.ns, dtype=float))
+        sxx = float(np.sum((ln_n - ln_n.mean()) ** 2))
+        flat = float(np.mean(r.rel_se))
+        naive = flat / math.sqrt(sxx)
+        # 实测各点 rel_se 不完全相同，所以只能比量级与相近程度
+        self.assertLess(abs(r.slope_se - naive) / naive, 0.5)
+        # 但逐点传播必须严格按各自的 rel_se 来算
+        num = float(np.sum(((ln_n - ln_n.mean()) ** 2) * np.asarray(r.rel_se) ** 2))
+        self.assertAlmostEqual(r.slope_se, math.sqrt(num) / sxx, places=12)
+
+    def test_sweep_reports_measured_survival_and_trials(self):
+        """trials 与 accept_rate 必须是实测值，且随 n 显著衰减。"""
+        r = fjc.saw_sweep([4, 12, 20], 1.0, seed=6, chains=200)
+        self.assertEqual(len(r.trials), len(r.ns))
+        self.assertEqual(len(r.chains_used), len(r.ns))
+        self.assertTrue(all(c == 200 for c in r.chains_used))
+        # 存活率随 n 单调下降，数量级差很多
+        self.assertGreater(r.trials[0] < r.trials[1] < r.trials[2], 0)
+        self.assertGreater(r.trials[2] / r.trials[0], 10)
+
+    def test_sweep_warns_when_it_cannot_fill_the_sample(self):
+        """试投上限兜住时要**说出来**是哪几个 n，不能静默少给。"""
+        r = fjc.saw_sweep([4, 30], 1.0, seed=2, chains=500,
+                          trials_per_n=20_000, trials_total=None)
+        self.assertLess(r.chains_used[1], 500)
+        self.assertTrue(any("n=30" in w for w in r.warnings))
+        self.assertTrue(any("没采满" in w for w in r.warnings))
+
+    def test_validation(self):
+        """上限都要抛中文 FJCInputError，且理由要写清楚是算力而非物理。"""
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_chain(31)                       # 超过 SAW_N_MAX
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_chain(0)                        # n 至少为 1
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_chain(5, chains=0)               # 链数至少为 1
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_chain(5, chains=10, max_chains=5)
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_chain(5, -1.0)                   # l 必须为正
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_sweep("5, 31")                   # 扫描里也有同一个上限
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_sweep("5, 5")                    # n 重复
+        with self.assertRaises(fjc.FJCInputError):
+            fjc.saw_sweep("")                        # 空的 n 列表
+        with self.assertRaises(fjc.FJCInputError) as cm:
+            fjc.saw_sweep([5, 25, 30], chains=20_000)   # 试投总预算
+        self.assertIn("超出预算", str(cm.exception))
+        # 预算没超的同一组 n 就该放行（说明卡的是总量，不是 n 的个数）
+        r = fjc.saw_sweep([5, 30], chains=200)
+        self.assertEqual(r.chains_used, [200, 200])
+        # 上限单独解除后确实能过（说明这些是表现/算力约束，不是物理约束）
+        r = fjc.saw_chain(9, 1.0, seed=1, chains=60, max_n=None)
+        self.assertEqual(r.chains, 60)
+
+    def test_to_dict_is_json_serialisable(self):
+        import json
+        c = json.loads(json.dumps(fjc.saw_chain(6, 1.0, seed=4, chains=8).to_dict()))
+        self.assertEqual(c["n"], 6)
+        self.assertEqual(len(c["points"]), 8)
+        self.assertEqual(len(c["points"][0]), 7 * 3)
+        self.assertEqual(len(c["ideal_points"]), 8)
+        self.assertEqual(c["n_max"], fjc.SAW_N_MAX)
+
+        s = json.loads(json.dumps(
+            fjc.saw_sweep([4, 8, 16], 1.0, seed=4, chains=150).to_dict()
+        ))
+        self.assertEqual(s["n"], [4, 8, 16])
+        self.assertEqual(len(s["R2_ideal"]), 3)
+        self.assertEqual(len(s["rel_se"]), 3)
+        self.assertEqual(len(s["trials"]), 3)
+        self.assertIsInstance(s["slope"], float)
+        self.assertIsInstance(s["nu_eff"], float)
+
+
 class TestLangevin(unittest.TestCase):
     """L(x) = coth(x) − 1/x。
 
@@ -1371,6 +1667,296 @@ class TestChainModels(unittest.TestCase):
                 self.assertAlmostEqual(fjc.model_h2(mp, n, 1.0), recur(n, c, g),
                                        places=9, msg=f"θ={theta} g={g} n={n}")
 
+    def test_energy_figure_is_empty_for_the_two_constraint_only_models(self):
+        """自由连接链与自由旋转链没有能量自由度：只能给一个 none 加一句中文理由。
+
+        这一条钉的是「为什么这两张图画不出来」有**一个**落点：卡片收起、前端不写 if，
+        全靠 energy_figure() 这条分支。所以它不能是死代码。
+        """
+        import json
+        for key in ("fjc", "frc"):
+            fig = fjc.energy_figure(fjc.ModelParams.of(key, theta_deg=self.THETA_PE))
+            self.assertEqual(fig["kind"], "none")
+            self.assertEqual(fig["model"], key)
+            self.assertTrue(fig["reason"].strip(), f"{key} 必须给出中文理由")
+            json.dumps(fig, ensure_ascii=False)
+
+    def test_energy_barrier_is_the_sampler_probability(self):
+        """图上的位垒与采样器用的是**同一个** p_trans：不同写法，同一个数。
+
+        hindered_barrier() 从 ⟨cosφ⟩ 解 σ 再回代，_torsion_steps() 直接写 (2c+1)/3。
+        两条路代数恒等，这里逐点对拍 —— 否则图上画的分布就不是采样器真正在抽的那个。
+        """
+        for c in (-0.5 + 1e-12, -0.4, 0.0, 0.25, 0.5, 0.68, 0.99):
+            sigma, delta_e, p_trans = fjc.hindered_barrier(c)
+            self.assertAlmostEqual(p_trans, (2.0 * c + 1.0) / 3.0, places=12, msg=f"c={c}")
+            # ΔE 与 σ 互为反函数（位垒就是「gauche 的玻尔兹曼因子取对数」的定义）。
+            # 比的是**相对**误差：c → COS_PHI_MIN 时 σ 能到 1e12，绝对小数位在那里没有意义
+            self.assertAlmostEqual(math.exp(-delta_e) / sigma, 1.0, places=12, msg=f"c={c}")
+
+    def test_energy_barrier_anchors(self):
+        """两个教科书锚点：聚乙烯的那条 ΔE = ln 4，以及 c = 0 处与自由旋转链的接缝。"""
+        pe = fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE, cos_phi=0.5)
+        fig = fjc.energy_figure(pe)
+        self.assertEqual(fig["kind"], "torsion")
+        # ⟨cosφ⟩ = 0.5 ⇒ σ = 1/4 ⇒ ΔE = ln 4 = 1.3863 kT —— 经典位阻因子 4
+        self.assertAlmostEqual(fig["barrier"]["sigma"], 0.25, places=12)
+        self.assertAlmostEqual(fig["barrier"]["delta_e_over_kt"], math.log(4.0), places=12)
+        self.assertAlmostEqual(fig["barrier"]["p_trans"], 2.0 / 3.0, places=12)
+        self.assertAlmostEqual(fig["cn"]["now"], 6.0, places=6)          # 聚乙烯的 C∞
+
+        # 三态的权重加起来是 1，且 gauche± 对称、比 trans 低 ΔE
+        lv = fig["levels"]
+        self.assertEqual([x["phi_deg"] for x in lv], [0.0, 120.0, -120.0])
+        self.assertAlmostEqual(sum(x["weight"] for x in lv), 1.0, places=12)
+        self.assertAlmostEqual(lv[1]["weight"], lv[2]["weight"], places=12)
+        self.assertAlmostEqual(lv[1]["u_over_kt"], fig["barrier"]["delta_e_over_kt"], places=12)
+        self.assertEqual(lv[0]["u_over_kt"], 0.0)                        # trans 是能量零点
+
+        # c = 0 ⇒ σ = 1 ⇒ ΔE = 0 ⇒ 三态等高 ⇒ 绕键自由旋转：这一点的 Cn 必须与
+        # 自由旋转链**精确**重合（两条闭式在这一格给出同一个浮点数，不是差不多）
+        zero = fjc.energy_figure(fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                    cos_phi=0.0))
+        self.assertEqual(zero["barrier"]["delta_e_over_kt"], 0.0)
+        # -log(1.0) 在 IEEE 下是 −0.0：数值上等于 0，但发到 JSON 里就是 "-0.0"，
+        # 所以内核里那行收拾不是多余的，这里钉它
+        self.assertEqual(math.copysign(1.0, zero["barrier"]["delta_e_over_kt"]), 1.0)
+        self.assertFalse(zero["barrier"]["all_gauche"])
+        self.assertEqual(zero["cn"]["now"], zero["cn"]["frc"])
+        self.assertAlmostEqual(zero["levels"][0]["weight"], 1.0 / 3.0, places=12)
+
+    def test_energy_cn_curve_is_the_closed_form(self):
+        """第二张图的纵轴：Cn = Cn_FRC·(1 + 2e^(ΔE))/3，逐点现算而不是另抄一份。"""
+        frc = fjc.ModelParams.of("frc", theta_deg=self.THETA_PE)
+        cn_frc = fjc.model_kuhn_over_l(frc)
+        fig = fjc.energy_figure(fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                   cos_phi=0.5))
+        cn = fig["cn"]
+        self.assertEqual(len(cn["delta_e"]), len(cn["values"]))
+        self.assertEqual(len(cn["delta_e"]), fjc.ENERGY_CN_POINTS)
+        self.assertAlmostEqual(cn["frc"], cn_frc, places=12)
+        # 横轴从截断点起步（ΔE → −∞ 画不出来），右端封在 COS_PHI_MAX 那个位垒上
+        self.assertEqual(cn["delta_e"][0], fjc.ENERGY_CN_DELTA_MIN)
+        self.assertAlmostEqual(cn["delta_e"][-1], fig["delta_max"], places=12)
+        for delta, value in zip(cn["delta_e"], cn["values"]):
+            self.assertAlmostEqual(value, cn_frc * (1.0 + 2.0 * math.exp(delta)) / 3.0,
+                                   places=6, msg=f"ΔE={delta}")
+        # 单调：位垒越高（越偏爱 trans）链越硬
+        self.assertEqual(cn["values"], sorted(cn["values"]))
+        # 聚乙烯那个点是硬锚点，不是随手标的一格
+        self.assertAlmostEqual(cn["pe_delta_e"], math.log(4.0), places=12)
+        # 3 位小数而不是 6：这个点用的是目录里的默认键角 DEFAULT_THETA_DEG = 109.47
+        # （截断值，不是 arccos(−1/3) 的 109.4712…），所以它落在 6 旁边而不是正好 6
+        self.assertAlmostEqual(cn["pe_cn"], 6.0, places=3)
+
+    def test_energy_all_gauche_endpoint_stays_finite_in_json(self):
+        """⟨cosφ⟩ 压到下界：ΔE 真的是 −∞，但 JSON 里不许出现 Infinity。"""
+        import json
+        fig = fjc.energy_figure(fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                   cos_phi=fjc.COS_PHI_MIN))
+        b = fig["barrier"]
+        self.assertTrue(b["all_gauche"])
+        self.assertIsNone(b["delta_e_over_kt"])     # 无穷用 null 表示
+        self.assertIsNone(b["sigma"])
+        self.assertEqual(b["p_trans"], 0.0)
+        # 真值画不出来就取图画得出的最低那条线，但三个态仍然都在
+        self.assertTrue(all(x["u_over_kt"] == fjc.ENERGY_CN_DELTA_MIN
+                            for x in fig["levels"][1:]))
+        # Cn 的下界：全部 gauche ⇒ (1+2e^ΔE)/3 → 1/3
+        self.assertAlmostEqual(fig["cn"]["now"], fig["cn"]["frc"] / 3.0, places=9)
+        text = json.dumps(fig, ensure_ascii=False)
+        for bad in ("Infinity", "NaN", "-Infinity"):
+            self.assertNotIn(bad, text)
+
+    # 要逐点验的那几个 ⟨cosφ⟩。−0.5 是滑块下界（ΔE 截断成 −3），−0.25 是**负 ΔE**
+    # 那一侧的代表 —— 井深差为负时 gauche 比 trans 低，是 a₃ 里那个绝对值的守卫。
+    TORSION_CASES = (-0.5, -0.25, 0.25, 0.5, 0.68, 0.99)
+
+    def test_energy_torsion_potential_wells_sit_on_the_three_states(self):
+        """U(φ) 那条曲线：241 个点，井底**正好**落在采样器抽的那三个 φ 上。
+
+        这一组钉的全是「图上的数就是内核里的数」——**不断言画法**：势垒多高是约定，
+        换一个 TORSION_BARRIER_RATIO 下面这些断言一条都不该动。
+        """
+        grid = None
+        for c in self.TORSION_CASES:
+            fig = fjc.energy_figure(fjc.ModelParams.of(
+                "hindered", theta_deg=self.THETA_PE, cos_phi=c))
+            p, u = fig["phi_deg"], fig["potential"]
+            if grid is None:
+                grid = p
+                # 1.5° 一格，而 0/±60/±120/±180 全是整格 —— 井底与极值点都落在格点上，
+                # 图上那几个数不需要插值，测的也就是图上的数
+                self.assertEqual(len(p), fjc.ENERGY_TORSION_POINTS)
+                self.assertEqual((p[0], p[-1]), (-180.0, 180.0))
+                self.assertEqual(len({round(p[i + 1] - p[i], 12)
+                                      for i in range(len(p) - 1)}), 1)
+                for anchor in (-180.0, -120.0, -60.0, 0.0, 60.0, 120.0, 180.0):
+                    self.assertIn(anchor, p)
+            else:
+                self.assertEqual(p, grid)      # 网格与 ΔE 无关，六组共用同一条横轴
+            self.assertEqual(len(u), len(p))
+
+            # 三个井底：既要是**极小**（离散二阶差分 > 0），又要数值上等于 levels 里
+            # 那个 u_over_kt —— 曲线上的点与读数行的数必须是同一个数。
+            for lv in fig["levels"]:
+                i = p.index(lv["phi_deg"])
+                self.assertGreater(u[i - 1] + u[i + 1] - 2.0 * u[i], 0.0)
+                self.assertAlmostEqual(u[i], lv["u_over_kt"], places=12)
+            # trans 是能量零点。ΔE < 0 时它落在两个 gauche 井**上面**，但仍是极小 ——
+            # 倒过来的是井深，不是井的位置
+            self.assertEqual(u[p.index(0.0)], 0.0)
+            # 井深差：U(±120°) − U(0°)，有限时与 barrier 里那个数是同一个数
+            # （all_gauche 时 barrier 里是 None —— JSON 里不能出现 Infinity）
+            d = u[p.index(120.0)] - u[p.index(0.0)]
+            self.assertAlmostEqual(u[p.index(-120.0)] - u[p.index(0.0)], d, places=12)
+            if fig["barrier"]["delta_e_over_kt"] is not None:
+                self.assertAlmostEqual(d, fig["barrier"]["delta_e_over_kt"], places=12)
+            # 纵轴范围就是数组自己的 max/min —— 由后端给，前端不自己挑
+            self.assertEqual(fig["u_max"], max(u))
+            self.assertEqual(fig["u_min"], min(u))
+            # 纵轴那条换算说明：1 kT = R·T（T 用 DEFAULT_TEMPERATURE）= 2.479 kJ/mol
+            self.assertAlmostEqual(fig["kt_in_kj_per_mol"],
+                                   fjc.R_GAS * fjc.DEFAULT_TEMPERATURE / 1000.0, places=9)
+            self.assertAlmostEqual(fig["kt_in_kj_per_mol"], 2.4789570296, places=9)
+
+    def test_energy_torsion_barrier_is_the_stated_convention(self):
+        """势垒高度是**约定**（TORSION_BARRIER_RATIO），井底不是 —— 这条测的是那个约定。
+
+        gauche↔gauche 那处连接的是**两个等价的井**，「比更高的那个井高多少」在那里
+        没有歧义，所以它有精确值 4|ΔE|；trans↔gauche 那处连接的两个井不等高（相差 ΔE），
+        顶点又是 −α(sinφ + sin2φ) = 3a₃sin3φ 这个超越方程的根，没有闭式 ——
+        所以那个数只从曲线上量，这里**不对它假造一个公式**。
+        """
+        for c in self.TORSION_CASES:
+            fig = fjc.energy_figure(fjc.ModelParams.of(
+                "hindered", theta_deg=self.THETA_PE, cos_phi=c))
+            p, u, b = fig["phi_deg"], fig["potential"], fig["barrier"]
+            # 传进来的 ΔE 是**截断过**的（⟨cosφ⟩ = −0.5 时真值是 −∞），
+            # 约定与图上那个数都建在截断值上，测试也跟着它
+            u_g = fig["levels"][1]["u_over_kt"]
+            measured = max(v for q, v in zip(p, u) if q >= 120.0) - u_g
+            self.assertEqual(measured, b["gg_over_kt"])          # 与图逐位一致
+            self.assertAlmostEqual(measured, fjc.TORSION_BARRIER_RATIO * abs(u_g),
+                                   places=12)
+            # 绝对值那一项是必需的：ΔE < 0 时势垒高度不能跟着变负。下面两条钉住它 ——
+            # 井底在下面（tg > 0），而另一条势垒**总**比 gauche↔gauche 那条低
+            self.assertGreater(b["tg_over_kt"], 0.0)
+            self.assertLess(b["tg_over_kt"], b["gg_over_kt"])
+
+    def test_energy_torsion_potential_is_flat_at_the_frc_seam(self):
+        """⟨cosφ⟩ = 0 ⇒ ΔE = 0 ⇒ 两个系数一起归零 ⇒ **整条曲线恒为 0**。
+
+        这不是画不出来，是那一点真的没有位阻：图上这条平线与 model_h2() 里受阻旋转链
+        精确退回自由旋转链说的是**同一件事**，图与闭式解在这一格必须同时归零。
+        """
+        fig = fjc.energy_figure(fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                   cos_phi=0.0))
+        self.assertFalse(fig["barrier"]["all_gauche"])
+        self.assertEqual(fig["barrier"]["delta_e_over_kt"], 0.0)
+        # 逐点比数值 0（α·cos 那一串浮点上未必给出精确 0，见 hindered_potential 里
+        # 那句「+ 0.0」的注释）
+        self.assertEqual(max(abs(v) for v in fig["potential"]), 0.0)
+        self.assertEqual((fig["u_min"], fig["u_max"]), (0.0, 0.0))
+        self.assertEqual(fig["cn"]["now"], fig["cn"]["frc"])     # 闭式解那一侧的接缝
+
+    def test_energy_torsion_potential_at_the_all_gauche_endpoint(self):
+        """⟨cosφ⟩ 压到下界：ΔE 是 −∞，曲线用截断值画 —— 真值画不出来，但方向是对的。
+
+        这一端最容易出的错是曲线整体翻号：井深差是负的，势垒高度不能跟着变负，
+        否则 0°/±120° 会从极小点翻成极大点、**井底跑掉**。下面那两条二阶差分就是钉它。
+        """
+        import json
+        fig = fjc.energy_figure(fjc.ModelParams.of("hindered", theta_deg=self.THETA_PE,
+                                                   cos_phi=fjc.COS_PHI_MIN))
+        b, p, u = fig["barrier"], fig["phi_deg"], fig["potential"]
+        self.assertTrue(b["all_gauche"])
+        self.assertTrue(all(math.isfinite(v) for v in u))
+        i0, i120 = p.index(0.0), p.index(120.0)
+        self.assertGreater(u[i0 - 1] + u[i0 + 1] - 2.0 * u[i0], 0.0)
+        self.assertGreater(u[i120 - 1] + u[i120 + 1] - 2.0 * u[i120], 0.0)
+        # gauche 井在 trans **下面** —— 这才是「gauche 更稳」的样子
+        self.assertLess(u[i120], u[i0])
+        self.assertAlmostEqual(u[i120], fig["levels"][1]["u_over_kt"], places=12)
+        # 势垒建在截断值 −3 上，所以它是 4×3 = 12 而不是 ∞ —— 读数行要注明这一点，
+        # 并排摆着那个「−∞」才不会被误读
+        self.assertEqual(b["gg_over_kt"], fjc.TORSION_BARRIER_RATIO * 3.0)
+        for bad in ("Infinity", "NaN", "-Infinity"):
+            self.assertNotIn(bad, json.dumps(fig, ensure_ascii=False))
+
+    def test_sampled_torsion_states_carry_the_barrier(self):
+        """最关键的一条：ΔE 不只是个换算出来的数 —— 它真的预言了采样的态比例。
+
+        从 _torsion_steps() 抽一大批，数出来的 trans 占比就是 p_trans、
+        gauche : trans 的个数比就是 σ。这样「那个位垒是能量差」才落在真实采样上。
+        """
+        for c in (0.0, 0.25, 0.5, 0.9):
+            sigma, delta_e, p_trans = fjc.hindered_barrier(c)
+            phi = fjc._torsion_steps(np.random.default_rng(3), (400_000,), c)
+            self.assertAlmostEqual(float(np.max(np.abs(phi))), 2.0 * math.pi / 3.0, places=12)
+            n_trans = int(np.count_nonzero(phi == 0.0))
+            n_gauche = phi.size - n_trans
+            self.assertAlmostEqual(n_trans / phi.size, p_trans, delta=0.01, msg=f"c={c}")
+            # gauche 有**两个**态（±120°），所以个数比是 2σ 而不是 σ ——
+            # σ 是单个 gauche 态相对 trans 的因子。用对数比是为了在 c=0.9（σ≈0.036）那一格
+            # 也拿相对误差衡量，而不是被绝对误差盖住
+            self.assertAlmostEqual(math.log(n_gauche / n_trans), math.log(2.0 * sigma),
+                                   delta=0.1, msg=f"c={c}：gauche(两个态)/trans 应当是 2σ")
+
+    def test_energy_bending_is_the_boltzmann_distribution(self):
+        """蠕虫状链那侧：采样器抽的 p(x) ∝ e^(κx) 就是 U/kT = κ(1−cosθ) 的玻尔兹曼分布。"""
+        mp = fjc.ModelParams.of("wlc", p=10.0)
+        fig = fjc.energy_figure(mp)
+        self.assertEqual(fig["kind"], "bending")
+        kappa, p_over_l, corr = fig["kappa"], fig["p_over_l"], fig["corr"]
+        self.assertAlmostEqual(kappa, fjc._wlc_kappa(math.exp(-1.0 / 10.0)), places=12)
+        # ⟨cosθ⟩ = L(κ) = e^(−l/p) 是构造出来的恒等式，页面上指纹卡的 corr[1] 就是它
+        self.assertAlmostEqual(fjc._langevin(kappa), corr, places=12)
+        self.assertAlmostEqual(corr, math.exp(-1.0 / p_over_l), places=12)
+
+        # 势的值域是 0（相邻键对齐，cos θ = 1）… 2κ（完全反向，cos θ = −1），
+        # 且就是 cos 的线性函数 —— xs 从 −1 排到 +1，所以首点是最高那级
+        cos = np.asarray(fig["cos"])
+        potential = np.asarray(fig["potential"])
+        self.assertAlmostEqual(float(cos[0]), -1.0, places=12)
+        self.assertAlmostEqual(fig["u_max"], 2.0 * kappa, places=12)
+        self.assertAlmostEqual(float(potential[0]), fig["u_max"], places=9)
+        self.assertAlmostEqual(float(potential[-1]), 0.0, places=12)
+        np.testing.assert_allclose(potential, kappa * (1.0 - cos), rtol=1e-12)
+
+        # 密度归一化、且在 cosθ = 1（相邻键完全对齐）那一端取最大值 κ。
+        # 3 位小数是**梯形法**在这 400 点网格上的误差（O(h²κ²) ≈ 2e-4），不是密度的误差
+        density = np.asarray(fig["density"])
+        area = float(np.sum(np.diff(cos) * (density[1:] + density[:-1]) / 2.0))
+        self.assertAlmostEqual(area, 1.0, places=3)
+        self.assertAlmostEqual(float(density[-1]), kappa, places=6)
+        self.assertEqual(int(np.argmax(density)), density.size - 1)
+
+        # 真正把话钉死的一条：从采样器抽出来的步矢量，相邻两个的余弦均值 = corr
+        steps = fjc._step_vectors_model(mp, np.random.default_rng(4), 2000, 60)
+        adjacent = np.sum(steps[:, :-1] * steps[:, 1:], axis=-1)
+        self.assertTrue(float(adjacent.min()) >= -1.0 and float(adjacent.max()) <= 1.0)
+        self.assertAlmostEqual(float(adjacent.mean()), corr, delta=0.005)
+
+    def test_energy_persistence_length_slope(self):
+        """第三、四张图的纵轴：p/l 与渐近 κ ≈ p/l + 1/2 —— 大 κ 端才成立。"""
+        fig = fjc.energy_figure(fjc.ModelParams.of("wlc", p=100.0))
+        ks = np.asarray(fig["kappa_scan"])
+        pl = np.asarray(fig["pl_scan"])
+        self.assertEqual(len(ks), fjc.ENERGY_KAPPA_POINTS)
+        self.assertEqual(len(pl), len(ks))
+        self.assertTrue(np.all(np.diff(ks) > 0.0))
+        # p/l = −1/ln L(κ)：就是 wlc_bending 的反函数，且与 κ 同向
+        np.testing.assert_allclose(
+            pl, [-1.0 / math.log(fjc._langevin(float(k))) for k in ks], rtol=1e-12)
+        # 渐近线只发 κ ≥ 1 那一段（再往左它给不出正数，画在对数轴上会变成 NaN）
+        asym = np.asarray(fig["pl_asymptote"])
+        self.assertTrue(np.all(asym[:, 0] >= 1.0))
+        np.testing.assert_allclose(asym[:, 1], asym[:, 0] - 0.5, rtol=1e-12)
+        # 当前点的 κ 与 p/l 差得就是那 1/2（p/l = 100 时相对误差 8e-6）
+        self.assertAlmostEqual(fig["kappa"] - fig["p_over_l"], 0.5, delta=0.005)
+        self.assertAlmostEqual(fig["p_over_l"], 100.0, places=12)
+
     def test_wlc_limits(self):
         """蠕虫状链的两端：L≫p 回到 ⟨h²⟩ ≈ 2pL；L≪p 退化成刚杆 ⟨h²⟩ ≈ L²。"""
         p = 10.0
@@ -1469,7 +2055,10 @@ class TestChainModels(unittest.TestCase):
     def test_model_catalog_is_json_safe(self):
         import json
         rows = fjc.model_catalog()
-        self.assertEqual([r["key"] for r in rows], list(fjc.MODEL_KEYS))
+        # 目录 = 四个解析模型 + 自回避行走。SAW **不在 MODEL_KEYS 里**（它进不去
+        # 公式层，理由见 fjc_core「自回避行走」那一节），但它是用户能选的模型，
+        # 所以必须出现在同一份目录里 —— 前端只认这一份。
+        self.assertEqual([r["key"] for r in rows], list(fjc.MODEL_KEYS) + ["saw"])
         json.dumps(rows, ensure_ascii=False)
         for r in rows:
             self.assertTrue(r["label"] and r["formula"] and r["note"])
@@ -1480,6 +2069,15 @@ class TestChainModels(unittest.TestCase):
         self.assertFalse(any(s["used"] for s in rows[0]["params"].values()))
         self.assertTrue(rows[1]["params"]["theta_deg"]["used"])
         self.assertTrue(rows[3]["params"]["p"]["used"])
+
+        # analytic 这一位就是「哪些算得了」的唯一真源：四个解析模型有闭式 ⟨h²⟩，
+        # 自回避行走没有 —— 前端靠它收起不适用的卡片，这里把它钉住。
+        saw = rows[-1]
+        self.assertTrue(all(r["analytic"] is True for r in rows[:-1]))
+        self.assertIs(saw["analytic"], False)
+        self.assertFalse(any(s["used"] for s in saw["params"].values()))
+        # ν 得进公式，且只能是 SAW_NU（别手抄一个数字进来）
+        self.assertIn(f"{fjc.SAW_NU:.7f}", saw["formula"])
 
     def test_fingerprint_curves(self):
         """模型指纹：关联的解析锚点、Cn 的收敛、四个模型的对比行。"""

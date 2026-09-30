@@ -164,6 +164,12 @@
   /* ---------------- 取数与联动 ---------------- */
 
   async function load() {
+    // 模型指纹画的是**纯理论**曲线（不采样、不算随机数），自回避行走没有闭式解、
+    // 根本没有这样的曲线可画。卡片已由 CSS 收起，这里再省掉这次请求，
+    // 并把上一份数据丢掉 —— 否则下次切回解析模型时会先闪一下旧曲线。
+    const spec = window.fjcApp ? window.fjcApp.modelSpec() : null;
+    if (spec && !spec.analytic) { fp = null; return; }
+
     const params = window.fjcApp ? window.fjcApp.modelParams() : {};
     try {
       const res = await fetch('/api/model-curves', {

@@ -27,7 +27,7 @@
     <a class="section-tab on" href="#sec-params" data-target="sec-params" aria-current="true">参数与结果</a>
     <a class="section-tab" href="#sec-viz" data-target="sec-viz">可视化</a>
     <a class="section-tab" href="#sec-scale" data-target="sec-scale">标度验证</a>
-    <a class="section-tab" href="#sec-table" data-target="sec-table">数值表</a>
+    <a class="section-tab" href="#sec-table" data-target="sec-table" data-only="analytic">数值表</a>
   </nav>
 
   <!-- 正文列：App Bar + 四个分区 + 页脚全在里面。
@@ -56,10 +56,16 @@
   <section class="page-section" id="sec-params" aria-labelledby="sec-params-t">
     <div class="section-head">
       <h2 id="sec-params-t">参数与结果</h2>
-      <p class="section-lede">
+      <p class="section-lede" data-only="analytic">
         链由 <span class="m">n</span> 个长度为 <span class="m">l</span> 的链段自由连接，无键角限制、无位阻。
         均方末端距 <span class="m">⟨h²⟩ = n·l²</span>，即 <span class="m">h = l√n</span>。
         结果的长度单位就是 <span class="m">l</span> 的单位 —— <span class="m">l</span> 填 1 nm，答案就是 nm。
+      </p>
+      <p class="section-lede" data-only="simulated">
+        当前是<strong>自回避行走</strong>：链在立方格点上走，每步六选一，但<strong>同一个格点不许重复访问</strong>。
+        这条约束把 ⟨R²⟩ 从 <span class="m">n·l²</span> 推到 <span class="m">n^(2ν)</span>，
+        而 ν 没有闭式解、只能采样着测 ——
+        所以这一页只留下这个模型真正算得出来的东西，其余卡片都收起来了。
       </p>
     </div>
 
@@ -99,7 +105,7 @@
     <section class="card" id="model-card" aria-labelledby="model-title">
       <div class="card-head">
         <h2 id="model-title">链模型</h2>
-        <div class="legend" id="model-readout" hidden></div>
+        <div class="legend" id="model-readout" hidden data-only="analytic"></div>
       </div>
       <div class="chain-controls model-controls">
         <div class="field">
@@ -153,7 +159,7 @@
 
       <!-- h → n 反解：正向是「给 n 求 h」，这里是反过来。必须说清是哪一种 h ——
            h_rms 和 nl 在同一个 n 下差一到两个数量级，只说「要 100」没有意义。 -->
-      <section class="card" id="solve-card" aria-labelledby="solve-title">
+      <section class="card" id="solve-card" aria-labelledby="solve-title" data-only="analytic">
         <div class="card-head">
           <h2 id="solve-title">由末端距反解链段数 <span class="m">h → n</span></h2>
         </div>
@@ -191,7 +197,7 @@
     <!-- 主结果与七个统计量成组：**保持上下**，不并排 ——
          主结果是一条铺满整行的「大字 + 右侧推导式」横带，七张统计卡在整行里
          正好排成一排；硬拆成左右两栏，两边反而各自空出一块。 -->
-    <div class="pair pair-result">
+    <div class="pair pair-result" data-only="analytic">
 
       <section class="hero" id="hero" aria-label="主结果">
         <div class="hero-label" id="hero-label">根均方末端距</div>
@@ -208,15 +214,20 @@
   <section class="page-section" id="sec-viz" aria-labelledby="sec-viz-t">
     <div class="section-head">
       <h2 id="sec-viz-t">可视化</h2>
-      <p class="section-lede">
+      <p class="section-lede" data-only="analytic">
         左边是这条链<strong>所有可能形状的分布</strong>，右边是<strong>随机走出来的一条</strong> ——
         两者说的不是同一件事，所以宽屏下特意让它们同屏。
+      </p>
+      <p class="section-lede" data-only="simulated">
+        自回避行走的「构象」就是格点上一条不回头的路径，画出来最直观 ——
+        右边这张画布上并排放着<strong>两团各 20 条</strong>：
+        同格点的理想链与自回避行走，共用一套相机，这样两边的尺度差能直接看出来。
       </p>
     </div>
 
     <div class="layout">
 
-    <section class="card" id="ph-card">
+    <section class="card" id="ph-card" data-only="analytic">
       <div class="card-head">
         <h2 id="chart-title">末端距分布 P(h)</h2>
         <div class="card-tools">
@@ -254,6 +265,10 @@
           <span class="field-label">随机种子</span>
           <input id="c-seed" type="text" inputmode="numeric" value="12345" autocomplete="off">
         </label>
+        <!-- 这里原来有一个「自回避对照」复选框。它已经删掉了：模式现在跟着**上面的链模型**
+             走 —— 在模型下拉里选「自回避行走（SAW）」，这张画布就画那两团链。
+             原来是两个入口各说各话：选了蠕虫状链还能勾「自回避对照」，
+             画布上画的和顶部参数说的不是一回事。 -->
         <label class="check">
           <input id="c-grid" type="checkbox" checked>
           <span>网格</span>
@@ -287,7 +302,7 @@
           <button id="c-new" class="tonal-btn" type="button">换一条</button>
           <button id="c-replay" class="tonal-btn" type="button">播放生长</button>
           <button id="c-png" class="outlined-btn" type="button">PNG</button>
-          <button id="c-csv" class="outlined-btn" type="button">CSV</button>
+          <button id="c-csv" class="outlined-btn" type="button">导出坐标 CSV</button>
         </div>
       </div>
 
@@ -306,7 +321,18 @@
       <p class="chart-note">
         链段长度 <span class="m">l</span> 与上方分布图共用（当前值见顶部参数行）。
         拖动旋转 · 滚轮缩放 · 双击或按 <kbd>0</kbd> 复位 · 聚焦后方向键旋转、<kbd>+</kbd>/<kbd>-</kbd> 缩放。
+        <strong>导出坐标 CSV</strong> 把每条链的每个顶点写成一行
+        （<code>chain,segment,x,y,z</code>，外加键矢量 <code>dx,dy,dz</code>、
+        累计轮廓长度 <code>s</code>、到原点距离 <code>r</code>），
+        文件头记着模型与参数，坐标 4 位小数，可直接读进 Python / Excel。
         这张图是<strong>一次随机实现</strong>；左边的 P(h) 是<strong>系综分布</strong>，两者说的不是同一件事。
+        勾上 <strong>自回避对照</strong> 时这张画布换成两团链：同一个立方格点上的<strong>理想链</strong>与
+        <strong>自回避行走</strong>并排、共用一套相机与视角，两者唯一的差别就是「不许重复访问格点」这一条约束
+        —— 能直接看出后者被撑开了。每边叠画 20 条：单条链的 <span class="m">R²</span> 涨落比溶胀比本身还大
+        （n = 30 时 std(R²)/⟨R²⟩ ≈ 0.69），各画一条的话有一小半时间会把结论反过来，那是涨落不是模型。
+        这个模式下 <strong>导出坐标 CSV</strong> 会置灰：它导的是当前链模型的构象，
+        不是这两团格点链；PNG 照常可用。自回避一侧的 <span class="m">n</span> 上限是 30（严格拒绝采样的算力上限，
+        不是物理上限），超了会夹到 30 并在上面明说。
       </p>
     </section>
 
@@ -317,9 +343,17 @@
   <section class="page-section" id="sec-scale" aria-labelledby="sec-scale-t">
     <div class="section-head">
       <h2 id="sec-scale-t">标度验证</h2>
-      <p class="section-lede">
+      <p class="section-lede" data-only="analytic">
         两件互不相干的验证：<span class="m">⟨R²⟩</span> 是不是真按 <span class="m">n</span> 线性长（下面那张扫描），
         以及高斯链的熵弹性在多大范围内够用（上面这张力–伸长）。
+        另外，链模型选到<strong>受阻旋转链</strong>或<strong>蠕虫状链</strong>时，
+        这一节末尾还会多出一张<strong>能量图景</strong> —— 四个模型里只有这两个有真正的
+        能量自由度（内旋转势垒、弯曲刚度），另外两个没有势可画。
+      </p>
+      <p class="section-lede" data-only="simulated">
+        验证的题目换了一个：本模型没有闭式解，「斜率是不是 1」这条判据问不出来，
+        要问的是<strong>实测指数是不是 2ν = 1.175</strong> ——
+        下面这张图把模拟点、斜率 1 的理想链参考线、斜率 2ν 的参考线画在一起。
       </p>
     </div>
 
@@ -327,7 +361,7 @@
          **曲线本身与 n、l 都无关**（L 里根本没有它们），这是它值得单画一张图的理由；
          n、l 只影响「绝对伸长」那一列和 pN 换算。所有数值都从 /api/force 返回的
          采样数组里读，前端一个公式都不写。 -->
-    <section class="card" id="force-card" aria-labelledby="force-title">
+    <section class="card" id="force-card" aria-labelledby="force-title" data-only="analytic">
       <div class="card-head">
         <h2 id="force-title">力–伸长曲线</h2>
         <div class="card-tools">
@@ -373,7 +407,7 @@
       </p>
     </section>
 
-    <section class="card" id="sweep-card">
+    <section class="card" id="sweep-card" data-only="analytic">
       <div class="card-head">
         <h2 id="sweep-title">链长扫描：链变长时末端距怎么变</h2>
         <div class="card-tools">
@@ -420,10 +454,79 @@
       </p>
     </section>
 
+    <!-- 自回避行走：这是个**独立**的模型，不是第五个「链模型」。
+         四个解析模型（fjc/frc/hindered/wlc）的 ⟨h²⟩ 都有闭式解，共用
+         fjc_core.model_h2() 一处供货；自回避行走没有 —— 它的 ⟨R²⟩ ∝ N^(2ν)
+         属于另一个普适类，指数只能数值测。所以它不进 MODEL_KEYS、不碰那四个
+         模型的公式层，而是自成一张卡片：自带理想链对照，把「扫描卡验证斜率
+         是不是 1」升级成「实测的 ν 是不是 0.588」。
+         数据来自 POST /api/saw/sweep，前端只负责画。
+         它同时是模型下拉里的第五项，靠目录里的 analytic 位驱动：
+         data-only="simulated" 让它在别的模型下收起，选中它则反过来收起
+         上面那一批要求闭式 ⟨h²⟩ 的卡片与整个数值表分区（见 style.css）。
+         收起/显示由 syncModelFields() 写的 body[data-model-kind] 决定。 -->
+    <section class="card" id="saw-card" aria-labelledby="saw-title" data-only="simulated">
+      <div class="card-head">
+        <h2 id="saw-title">自回避行走：⟨R²⟩ 还正比于 n 吗</h2>
+        <div class="card-tools">
+          <div class="legend" id="saw-legend" hidden></div>
+          <button id="w-png" class="outlined-btn" type="button" disabled>PNG</button>
+        </div>
+      </div>
+
+      <div class="chain-controls">
+        <div class="field field-lg">
+          <label class="field-label" for="w-n">链段数 <span class="m">n</span>（可多个，每个 ≤ 30）</label>
+          <input id="w-n" type="text" value="5, 8, 12, 16, 20, 25, 30" autocomplete="off">
+        </div>
+        <div class="field field-sm">
+          <label class="field-label" for="w-chains">每个 n 的链数 <span class="m">M</span></label>
+          <input id="w-chains" type="text" inputmode="numeric" value="1000" autocomplete="off">
+        </div>
+        <div class="field field-sm">
+          <label class="field-label" for="w-seed">随机种子</label>
+          <input id="w-seed" type="text" inputmode="numeric" value="2026" autocomplete="off">
+        </div>
+        <div class="btn-row">
+          <button id="w-run" class="btn-primary" type="button">运行模拟</button>
+          <button id="w-small" class="tonal-btn" type="button"
+                  title="短链便宜得多，同样的预算下能把统计误差压小一个数量级">小 n 大样本</button>
+          <button id="w-csv" class="outlined-btn" type="button" disabled>汇总 CSV</button>
+          <button id="w-json" class="outlined-btn" type="button" disabled>完整 JSON</button>
+        </div>
+      </div>
+
+      <div id="saw-alerts" class="alerts" role="status" aria-live="polite"></div>
+
+      <div class="chart-body" id="saw-body">
+        <svg id="saw-chart" viewBox="0 0 1240 500" role="img" tabindex="0"
+             aria-labelledby="saw-title" aria-describedby="saw-desc"></svg>
+        <div class="tooltip" id="saw-tooltip" hidden></div>
+      </div>
+
+      <div class="compare" id="saw-summary"></div>
+
+      <p class="chart-note" id="saw-desc">
+        自回避行走是<strong>立方格点</strong>上的一步一格、<strong>同一个格点不许走第二次</strong>的随机行走
+        （格点常数就是 <span class="m">l</span>，与顶部参数行共用）。
+        同格点的理想链每步 6 选 1、不管走没走过，<span class="m">⟨R²⟩ = n·l²</span> 精确成立
+        —— 所以图上那条<strong>斜率 1 的直线</strong>是理想链，而模拟点会明显跑到它<strong>上方</strong>：
+        这就是<strong>溶胀</strong>，链被迫比理想链舒展，因为回头会撞上自己。
+        渐近地 <span class="m">⟨R²⟩ ∝ n^(2ν)</span>，文献值 <span class="m">2ν = 1.175194</span>（虚线）。
+        但<strong>这片 n 区间（≤ 30）测出来的斜率约 1.19–1.22，是偏高的</strong>：有限尺寸修正的符号
+        在这个窗口里为正，渐近值要 n 很大才到 —— 所以上面报的是「这片区间的<strong>有效</strong> ν」，
+        不是「测出了 0.588」。这一条不是采样出错，是短链的真实现象。也因此上面那条虚线
+        <strong>和拟合直线几乎重合</strong>（只差百分之一点几）—— 这两条线分不分得开不是判据，
+        那个 σ 数才是。
+        每个 n 采 M 条<strong>独立</strong>链，点上的小竖线是<strong>每个 n 各自实测</strong>的 ±2σ 涨落。
+        鼠标悬停圆点可读数，聚焦后按 ←/→ 逐个看。
+      </p>
+    </section>
+
     <!-- 模型指纹：两张**纯理论**曲线（不采样），回答「四个模型的差别从哪来」。
          数据来自 POST /api/model-curves —— 唯一那份在 fjc_core.model_fingerprint()，
          前端只负责画。 -->
-    <section class="card" id="fingerprint-card" aria-labelledby="fingerprint-title">
+    <section class="card" id="fingerprint-card" aria-labelledby="fingerprint-title" data-only="analytic">
       <div class="card-head">
         <h2 id="fingerprint-title">模型指纹</h2>
         <div class="legend" id="fp-legend" hidden></div>
@@ -454,10 +557,116 @@
         </div>
       </div>
     </section>
+
+    <!-- 能量图景：四个模型里**只有两个**有真正的能量自由度 —— 受阻旋转链的内旋转
+         势垒、蠕虫状链的弯曲刚度。另外两个画不出东西来（自由连接链除固定键长外
+         无约束 ⇒ 势恒为 0；自由旋转链的键角是**硬约束**不是势），所以这张卡在它们
+         下面整张收起 —— 按**具体模型**而不是按 analytic/simulated 显隐
+         （body[data-model]，见 style.css）。两张子卡各自只在对应模型下显示。
+         所有数组都来自 POST /api/energy，唯一那份在 fjc_core.energy_figure()，
+         前端一个公式都不写。 -->
+    <section class="card" id="energy-card" aria-labelledby="energy-title">
+      <div class="card-head">
+        <h2 id="energy-title">能量图景</h2>
+        <div class="legend" id="en-readout" hidden></div>
+      </div>
+
+      <!-- 受阻旋转链：内旋转势垒 -->
+      <div class="layout" id="en-torsion">
+        <div>
+          <div class="chart-body" id="torsion-body">
+            <svg id="torsion-chart" viewBox="0 0 900 380" role="img" tabindex="0"
+                 aria-labelledby="torsion-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="torsion-title">内旋转势的 U(φ) 曲线与三态布居</strong>：左图是
+            <strong>势</strong>，右图是<strong>布居</strong>，两张图画的是两件事。
+            采样器只抽 <span class="m">φ = 0°</span>（trans）与 <span class="m">±120°</span>
+            （gauche）这<strong>三个离散值</strong> —— 所以右图是三根柱，不是一条分布曲线。
+            左图那条三井曲线，井底正好落在那三个态上（三个点就是），两个井底的高度差就是
+            <span class="m">ΔE/kT = ln((1+2⟨cosφ⟩)/(1−⟨cosφ⟩))</span>。它<strong>不是
+            120° 周期</strong>的：井底间距是 120°、三口井一样深，但两条势垒不一样高
+            （trans↔gauche 那条恒比 gauche↔gauche 那条低），而 120° 周期会强制它们一样高
+            —— 整条曲线是 <strong>360° 周期</strong>的。
+            有三件事要如实说明：<strong>第一，井底位置与井深是模型的预言，势垒高度是画法
+            约定</strong> —— 模型只给了 ΔE 这一个数，要画一条曲线还得另外定它多高，本图取的是
+            「两个 gauche 井之间 = <span class="m">4|ΔE|</span>」，换个约定曲线会变高变矮，
+            而<strong>三个井底一动不动</strong>；<strong>第二，对这条连续曲线做玻尔兹曼积分
+            得到的权重，与右图那三根柱不是同一个数</strong>（三态是<strong>离散</strong>近似），
+            曲线说的是「ΔE 是从哪来的」，不是「采样器在按它抽」；
+            <strong>第三，<span class="m">⟨cosφ⟩ = 0</span> 时这条曲线是精确的平线</strong>
+            （两个系数一起归零），那一点上受阻旋转链与自由旋转链<strong>精确重合</strong> ——
+            平线不是画不出来，是那里真的没有位阻。
+            另有两处：<span class="m">⟨cosφ⟩ → 1</span> 时几乎全 trans（井越来越深），
+            <span class="m">⟨cosφ⟩ = −1/2</span> 时 ΔE 真的是 <span class="m">−∞</span>，
+            曲线用截断值 <span class="m">−3 kT</span> 画 —— 真值画不出来，但方向是对的
+            （0° 那个井被抬到两个 gauche 井上面，而不是整条翻过来）；文献常把 trans 画在
+            <span class="m">180°</span>、gauche 画在 <span class="m">±60°</span>
+            （与本图的 0°/±120° 只差一个 180° 平移，是同一个东西）。
+            还有链上<strong>第一个</strong>二面角没有参考平面，采样器对它取的是均匀分布，
+            所以右图那种三态布居描述的是第二个键往后的每一段。
+          </p>
+        </div>
+        <div>
+          <div class="chart-body" id="cn-barrier-body">
+            <svg id="cn-barrier-chart" viewBox="0 0 880 400" role="img" tabindex="0"
+                 aria-labelledby="cn-barrier-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="cn-barrier-title">特征比 Cn 随位垒</strong>：横轴是 gauche 相对 trans
+            的能量差 <span class="m">ΔE/kT = ln((1+2⟨cosφ⟩)/(1−⟨cosφ⟩))</span>（纵轴对数）。
+            位垒越高、trans 越占优，链越僵硬、Cn 越大。三个锚点：
+            <span class="m">ΔE = 0</span> 处 Cn 正好等于该键角下<strong>自由旋转链</strong>的值
+            （三态等权重 ⇒ 绕键自由旋转）；<span class="m">ΔE = ln4 ≈ 1.386 kT</span> 是聚乙烯
+            （<span class="m">⟨cosφ⟩ ≈ 0.5</span>，正是经典的位阻因子 4），Cn ≈ 6，
+            对上实测的 C∞ ≈ 6.7；往左到 <span class="m">−∞</span>（全 gauche）则
+            Cn 落到自由旋转链的 1/3。曲线本身是逐点回内核的
+            <span class="m">Cn</span> 公式现算的，不是拟合。
+          </p>
+        </div>
+      </div>
+
+      <!-- 蠕虫状链：弯曲刚度 -->
+      <div class="layout" id="en-bending">
+        <div>
+          <div class="chart-body" id="bending-body">
+            <svg id="bending-chart" viewBox="0 0 900 380" role="img" tabindex="0"
+                 aria-labelledby="bending-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="bending-title">弯曲势与它给出的键角分布</strong>：左图是
+            <span class="m">U(cosθ)/kT = κ(1 − cosθ)</span> —— 相邻键对齐时能量为 0、
+            完全反向时是 <span class="m">2κ</span>，κ 就是「弯一下要花多少 kT」。
+            右图是<strong>同一个势的玻尔兹曼分布</strong>
+            <span class="m">p ∝ e^(κ·cosθ)</span>，竖线标出它的均值
+            <span class="m">⟨cosθ⟩ = L(κ) = e^(−l/p)</span>。
+            这不是巧合：采样器抽的那步逆变换就是从这个分布来的，所以右图和左图是
+            同一件事的两种画法。κ 越小分布越平，<span class="m">κ → 0</span> 时退化成均匀分布
+            —— 蠕虫状链在那里<strong>退回自由连接链</strong>。竖线位置与「模型指纹」卡的
+            方向关联第一项是同一个数，两处可以对上。
+          </p>
+        </div>
+        <div>
+          <div class="chart-body" id="pl-kappa-body">
+            <svg id="pl-kappa-chart" viewBox="0 0 880 400" role="img" tabindex="0"
+                 aria-labelledby="pl-kappa-title"></svg>
+          </div>
+          <p class="chart-note">
+            <strong id="pl-kappa-title">持久长度随弯曲刚度</strong>：两条轴都是对数。
+            界面上填的是持久长度 <span class="m">p</span>，κ 是由它反解出来的
+            （解 <span class="m">L(κ) = e^(−l/p)</span>，二分到机器精度）—— 所以这条曲线
+            也是内核那条公式本身，不是拟合。虚线是渐近式
+            <span class="m">κ ≈ p/l + 1/2</span>：<span class="m">p/l</span> 大时两条线几乎重合，
+            所以「κ 就等于 p/l」在刚性链上够用；<span class="m">p/l</span> 接近 1 时
+            它开始偏，那半项不能丢 —— 两条线分家的地方，正是那个直觉失效的地方。
+          </p>
+        </div>
+      </div>
+    </section>
   </section>
 
   <!-- ============ 分区四：数值表 ============ -->
-  <section class="page-section" id="sec-table" aria-labelledby="sec-table-t">
+  <section class="page-section" id="sec-table" aria-labelledby="sec-table-t" data-only="analytic">
     <div class="section-head">
       <h2 id="sec-table-t">数值表</h2>
       <p class="section-lede">当前各个 <span class="m">n</span> 的全部统计量，制表符分隔，可直接粘进 Excel。</p>
@@ -585,7 +794,9 @@
 <script src="backdrop.js"></script>
 <script src="chain3d.js"></script>
 <script src="sweep.js"></script>
+<script src="saw.js"></script>
 <script src="models.js"></script>
+<script src="energy.js"></script>
 <script src="ai.js"></script>
 </body>
 </html>

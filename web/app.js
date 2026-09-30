@@ -86,13 +86,25 @@ async function compute(ns, l) {
 
 /* ---------------- 链模型 ----------------
  *
- * 四个模型的目录（标签、公式、说明、参数范围）从 GET /api/models 拉 —— 唯一的那份
- * 在 fjc_core.model_catalog()，JS 里不抄第二份，所以界面上这个下拉永远和服务端一致。
- * 参数字段按模型显隐：自由旋转链要键角、受累旋转链再多一个 ⟨cosφ⟩、
- * 蠕虫状链改用持久长度 p。
+ * 模型目录（标签、公式、说明、参数范围、以及 analytic 那一位）从 GET /api/models 拉 ——
+ * 唯一的那份在 fjc_core.model_catalog()，JS 里不抄第二份，所以界面上这个下拉永远和服务端
+ * 一致。目录里有五项：四个解析模型 + 自回避行走。参数字段按模型显隐：自由旋转链要键角、
+ * 受阻旋转链再多一个 ⟨cosφ⟩、蠕虫状链改用持久长度 p、自回避行走三个都不用。
+ *
+ * analytic 是「这个模型有没有闭式 ⟨h²⟩」。它决定页面上一批卡片与整个数值表分区是显示还是
+ * 收起（见 syncModelFields 写进 body 的 data-model-kind，样式在 style.css）——
+ * 收起来的那些全部出自 /api/compute、/api/force、/api/model-curves，都要求闭式解。
  */
 
 let MODEL_BY_KEY = new Map();
+
+/* 页面「哪些块显示」一变（切到自回避行走会让好几个分区与卡片收起、又放出另外几个），
+   scrollspy 就得重量一次栏高、再重挑一次当前分区。钩子由 initScrollSpy() 装上，
+   在那之前是个空函数。
+   （分区本身被收起时不用靠这个钩子：sync() 每次都现筛可见分区再挑，因为
+   display:none 的元素 top 恒为 0，会永远满足「top ≤ 偏移」而霸住高亮。这里补的是
+   另外两件它管不着的：栏高与滚动条长度的变化。） */
+let layoutSync = () => {};
 
 /** 当前模型 + 参数，直接读界面 —— 计算、3D、扫描三处取数共用这一个。 */
 function modelParams() {
@@ -108,6 +120,13 @@ function modelParams() {
   if (spec.params.cos_phi.used) out.cos_phi = num('in-cosphi', spec.params.cos_phi.default);
   if (spec.params.p.used) out.p = num('in-p', spec.params.p.default);
   return out;
+}
+
+/** 当前模型在目录里的那一项（目录 = `/api/models` 给的那份，见 loadModels）。
+ *  chain3d.js 要问「现在这个模型有没有闭式解」，而目录在 app.js 手里 ——
+ *  所以从这里出去，和 modelParams 同一个规矩。目录还没拉回来时返回 null。 */
+function modelSpec() {
+  return MODEL_BY_KEY.get($('in-model').value) || null;
 }
 
 /** 在某段说明下面挂一行模型注释（没有就建一个）。
@@ -134,6 +153,27 @@ function syncModelFields() {
   $('theta-wrap').hidden = !spec.params.theta_deg.used;
   $('cosphi-wrap').hidden = !spec.params.cos_phi.used;
   $('p-wrap').hidden = !spec.params.p.used;
+  /* 模型分两类，这一位决定页面上**哪些块适用**（见 style.css 里按 data-only 的那几条）：
+     有闭式解的四个模型，力–伸长 / h→n 反解 / 模型指纹 / 数值表 / P(h) / 主结果
+     全都成立；自回避行走没有闭式解，那些「按公式算」的块一条都不适用，全部收起。
+     写在 body 的属性上、由 CSS 去收，而不是逐个元素设 hidden —— `.card, .hero`
+     是 display:flex，会盖掉 [hidden]（这个坑 style.css 里已经踩过一次，
+     见那里的 .ai-drawer[hidden]）。 */
+  const kind = spec.analytic ? 'analytic' : 'simulated';
+  /* 除了上面那个二分类，还要把**具体是哪个模型**写到 body 上：能量图景那张卡只有
+     受阻旋转链与蠕虫状链有内容（另外两个没有能量自由度），它是按模型而不是按类别
+     显隐的 —— 于是它会在 kind 不变的时候出现或消失（fjc → wlc 两边都是 analytic）。
+     所以两个属性任一变了都要重挑当前分区、重摆占位虚框。 */
+  const changed = document.body.dataset.modelKind !== kind
+    || document.body.dataset.model !== spec.key;
+  document.body.dataset.modelKind = kind;
+  document.body.dataset.model = spec.key;
+  if (changed) {
+    layoutSync();     // 显示的东西变了，scrollspy 得重新挑一次当前分区
+    // 收起的卡片要把自己的占位虚框带走、放出来的要重新要一个（读 offsetParent 会
+    // 强制一次样式重算，所以上面那行属性刚写完就能读到对的可见性）。
+    syncGhosts();
+  }
   // 说明里带默认参数（「键角固定为 109.47°」这种），所以换成当前输入框里的值
   const now = modelParams();
   $('model-formula').textContent = spec.formula;
@@ -840,11 +880,17 @@ function initScrollSpy() {
     requestAnimationFrame(() => {
       ticking = false;
       const offset = stickyTop + 24;
-      let cur = secs[0];
-      secs.forEach((s) => { if (s.getBoundingClientRect().top <= offset) cur = s; });
-      // 滚到底时最后一节可能永远没越过阈值，直接钉到最后一个
+      /* 只数**看得见**的分区。被收起的分区（自回避行走下没有数值表那节）
+         display:none，它的 getBoundingClientRect().top 恒为 0，于是永远满足
+         `top <= offset`，会把高亮一直霸在自己身上。现算一遍可见列表最省事 ——
+         比再挂一个「模型换了要重挑」的钩子稳。 */
+      const vis = secs.filter((s) => s.offsetParent !== null);
+      if (!vis.length) return;
+      let cur = vis[0];
+      vis.forEach((s) => { if (s.getBoundingClientRect().top <= offset) cur = s; });
+      // 滚到底时最后一节可能永远没越过阈值，直接钉到最后一个**看得见的**
       if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 6) {
-        cur = secs[secs.length - 1];
+        cur = vis[vis.length - 1];
       }
       tabs.forEach((t) => {
         const on = t.dataset.target === cur.id;
@@ -869,6 +915,9 @@ function initScrollSpy() {
     if (nav) ro.observe(nav);
   }
   window.addEventListener('load', () => { measure(); sync(); });
+  // 换模型会让一批分区/卡片收起或出现（见 syncModelFields 里的 data-model-kind）——
+  // 那时栏高和「哪些分区看得见」都变了，得重量一次再重挑一次。
+  layoutSync = () => { measure(); sync(); };
   sync();
 
   tabs.forEach((t) => t.addEventListener('click', (ev) => {
@@ -905,6 +954,22 @@ const CARD_SIZE_KEY = 'fjc-card-sizes';
 
 function cardEls() {
   return Array.from(document.querySelectorAll('.card, .hero'));
+}
+
+/** 当前**真的显示着**的卡片。
+ *
+ *  切到自回避行走时会有一批卡片被收起来（display:none），而它们并没有从 DOM 里消失。
+ *  要读隐藏卡的**布局**就得避开它：隐藏元素的 getBoundingClientRect() 全是 0，
+ *  拿它算出来的偏移量是错的。目前只有 reclampCards() 需要这一份。
+ *
+ *  **多数地方仍要用全量的 cardEls()**，而且理由各不相同：
+ *  saveCardPos / applyCardPos 是从零重建整份记录，按可见性过滤会把隐藏卡已存的
+ *  偏移悄悄删掉；syncGhosts 正相反，它得遍历到隐藏卡才能把那张卡留下的虚框**扫掉**
+ *  （见那里的注释）；拖动的命中与取尺寸都是 pointerdown 打在卡片自己身上，
+ *  能点到就一定是显示着的。
+ */
+function visibleCards() {
+  return cardEls().filter((c) => c.offsetParent !== null);
 }
 
 /* 键：init 时钉死（有 id 用 id，其余按文档顺序编 anon#N）。
@@ -1085,12 +1150,17 @@ function slotGhost(card) {
   return g;
 }
 
-/** 占位虚框和实际位置对齐一遍：松手、窗口变化、字体就位之后各叫一次。 */
+/** 占位虚框和实际位置对齐一遍：松手、窗口变化、字体就位、换模型之后各叫一次。 */
 function syncGhosts() {
+  /* 遍历**全量**卡片，但只给看得见的那些留虚框。被收起的卡（换到自回避行走时那几张）
+     必须把虚框**去掉**：分区里会留一个谁也认不出来的空框，而卡片的 inline offset
+     还原封不动地存着（显示回来时会自己再要一个）。这里用全量而不是 visibleCards()，
+     正是为了把收起那张的框扫掉 —— 只遍历可见的话它会一直挂在那儿。 */
   cardEls().forEach((card) => {
     const sec = sectionOf(card);
     if (!sec.classList || !sec.classList.contains('page-section')) return;
     const g = ghostOf(sec, card.dataset.cardKey);
+    if (card.offsetParent === null) { if (g) g.remove(); return; }   // 收起了：不留框
     const { x, y } = cardOffset(card);
     if (!x && !y) { if (g) g.remove(); return; }
     slotGhost(card);
@@ -1108,9 +1178,13 @@ function homeCard(card, opts = {}) {
   if (opts.tidy !== false) syncGhosts();
 }
 
-/** 窗口变窄变高之后，把已经挪出去的卡片拉回分区里（否则会挂在分区外头）。 */
+/** 窗口变窄变高之后，把已经挪出去的卡片拉回分区里（否则会挂在分区外头）。
+ *  只看看得见的卡：dragBounds() 读的是 getBoundingClientRect()，
+ *  对 display:none 的卡会拿到 width/height = 0、left/top = 0，
+ *  于是算出一个错位的范围、再把错的偏移量写回去 —— 用户下次显示这张卡时
+ *  它就跑偏了。收起期间不动它，原样存着。 */
 function reclampCards() {
-  cardEls().forEach((card) => {
+  visibleCards().forEach((card) => {
     const { x, y } = cardOffset(card);
     if (!x && !y) return;
     const b = dragBounds(card);
@@ -1747,6 +1821,10 @@ function updateForceHover(dataX) {
 }
 
 async function refreshForce(n, l) {
+  // 力–伸长是 FJC 的解析解，自回避行走没有同等地位的关系式（卡片也收起来了）。
+  const spec = modelSpec();
+  if (spec && !spec.analytic) return;
+
   const body = $('force-body');
   body.classList.add('busy');
   $('force-png').disabled = true;
@@ -1790,6 +1868,18 @@ let debounceTimer = null;
 async function refresh() {
   syncNChips();      // 放在最前面：输入不合法提前返回时，chip 的选中态也已经跟上了
   syncKuhnChips();   // Kuhn 选中态同理（l 被手改掉就该灭掉）
+
+  /* 自回避行走：这一页「按公式算」的东西一件都不适用（没有闭式解），
+     所以**不去打 /api/compute** —— 打了服务端会返 400，顶部告警条上就挂着一条
+     假报错，而下面那些卡片本来也都要收起来。收起由 CSS 按 body 的 data-model-kind
+     做，这里只负责把上一次解析模型留下的告警清掉、别留个过期的数字在屏幕上。 */
+  const spec = modelSpec();
+  if (spec && !spec.analytic) {
+    setAlerts(null, []);
+    $('chart-body').classList.remove('busy');
+    return;
+  }
+
   let ns;
   let l;
   try {
@@ -2072,6 +2162,8 @@ loadModels(storedParams.model).catch(() => {}).then(refresh);
 window.fjcApp = {
   // 当前链模型与它的参数（计算 / 3D / 扫描 / 助手共用这一份读法）
   modelParams,
+  // 当前模型在目录里的那一项 —— 3D 卡靠它知道这个模型有没有闭式解
+  modelSpec,
 
   getState() {
     return {
@@ -2091,8 +2183,19 @@ window.fjcApp = {
     if (n !== undefined) { $('in-n').value = String(n); touched.push('in-n'); }
     if (l !== undefined) { $('in-l').value = String(l); touched.push('in-l'); }
     if (model !== undefined) {
-      if (!MODEL_BY_KEY.has(String(model))) {
+      const want = MODEL_BY_KEY.get(String(model));
+      if (!want) {
         return { ok: false, error: `没有这个链模型：${model}` };
+      }
+      // 自回避行走在目录里，但它**没有闭式解** —— 切过去会把整页「按公式算」的
+      // 卡片全收起来。助手（或任何脚本）静默把用户面前的页面换掉，比报个错糟得多，
+      // 所以这里只放四个解析模型过去，SAW 由用户自己在下拉里选。
+      if (!want.analytic) {
+        return {
+          ok: false,
+          error: `${want.label}没有闭式解，只做实空间采样，页面上多数卡片不适用；`
+            + '要切到它请在模型下拉里手动选。',
+        };
       }
       $('in-model').value = String(model);
       syncModelFields();
